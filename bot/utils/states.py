@@ -2,7 +2,13 @@ from aiogram.fsm.state import State, StatesGroup
 
 
 class OrderFlow(StatesGroup):
-    waiting_phone = State()  # buyurtma berishdan oldin telefon so'ralganda
+    waiting_bot_name = State()      # xohlagan bot nomi (nickname)
+    waiting_bot_username = State()  # xohlagan bot username'i
+
+
+class TopupFlow(StatesGroup):
+    waiting_custom_amount = State()
+    waiting_receipt = State()
 
 
 class AdminAddProduct(StatesGroup):
@@ -10,6 +16,11 @@ class AdminAddProduct(StatesGroup):
     description = State()
     price = State()
     category = State()
+    media = State()
+
+
+class AdminEditProduct(StatesGroup):
+    waiting_value = State()  # tahrirlanayotgan maydon uchun yangi qiymat
 
 
 class AdminAddSubscription(StatesGroup):
@@ -19,14 +30,22 @@ class AdminAddSubscription(StatesGroup):
     chat_id = State()
 
 
-class AdminBalanceAdjust(StatesGroup):
-    user_id = State()
-    amount = State()
-
-
 class AdminReferralPercent(StatesGroup):
     percent = State()
 
 
 class AdminBroadcast(StatesGroup):
     content = State()
+
+
+class AdminManageUsers(StatesGroup):
+    search_id = State()
+    balance_amount = State()
+
+
+class AdminManageAdmins(StatesGroup):
+    add_id = State()
+
+
+class AdminEditText(StatesGroup):
+    waiting_value = State()  # tahrirlanayotgan matn kaliti uchun yangi qiymat

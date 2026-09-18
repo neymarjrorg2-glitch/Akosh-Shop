@@ -2,6 +2,7 @@ from datetime import datetime, timedelta
 from typing import Optional, Sequence
 
 from sqlalchemy import select, func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import ADMIN_IDS, DEFAULT_REFERRAL_PERCENT, ORDER_DEADLINE_HOURS
@@ -10,10 +11,13 @@ from bot.database.models import (
     BotProduct,
     Order,
     Transaction,
+    TopupRequest,
     MandatorySubscription,
     UserSubscriptionConfirmation,
     Setting,
 )
+
+MIN_TOPUP_AMOUNT = 5000
 
 
 # ---------- FOYDALANUVCHI ----------
@@ -25,11 +29,8 @@ async def get_or_create_user(
     full_name: Optional[str],
     referred_by: Optional[int] = None,
 ) -> tuple[User, bool]:
-    """Foydalanuvchini qaytaradi, agar mavjud bo'lmasa - yangi yaratadi.
-    Ikkinchi qiymat - foydalanuvchi yangi yaratilganini bildiradi (True/False)."""
     user = await session.get(User, user_id)
     if user:
-        # profil ma'lumotlarini yangilab turamiz
         user.username = username
         user.full_name = full_name
         await session.commit()
@@ -37,11 +38,9 @@ async def get_or_create_user(
 
     is_admin = user_id in ADMIN_IDS
 
-    # o'zini-o'zi referral qilishning oldini olish
     if referred_by == user_id:
         referred_by = None
 
-    # taklif qiluvchi haqiqatan mavjudligini tekshiramiz
     if referred_by:
         inviter = await session.get(User, referred_by)
         if not inviter:
@@ -70,6 +69,14 @@ async def set_phone(session: AsyncSession, user_id: int, phone: str) -> None:
         await session.commit()
 
 
+async def set_user_blocked(session: AsyncSession, user_id: int, blocked: bool) -> Optional[User]:
+    user = await session.get(User, user_id)
+    if user:
+        user.is_blocked = blocked
+        await session.commit()
+    return user
+
+
 async def adjust_balance(
     session: AsyncSession,
     user_id: int,
@@ -77,7 +84,6 @@ async def adjust_balance(
     tx_type: str,
     description: Optional[str] = None,
 ) -> None:
-    """Balansni o'zgartiradi (musbat - qo'shish, manfiy - ayirish) va tranzaksiya yozadi."""
     user = await session.get(User, user_id)
     if not user:
         return
@@ -108,13 +114,11 @@ async def set_referral_percent(session: AsyncSession, percent: float) -> None:
 
 
 async def apply_referral_bonus_if_first_topup(session: AsyncSession, user: User, topup_amount: float) -> None:
-    """Foydalanuvchi birinchi marta balans to'ldirganda, uni taklif qilgan odamga bonus beradi.
-    Faqat 1 marta (birinchi to'ldirishda) ishlaydi."""
+    """Foydalanuvchi birinchi marta balans to'ldirganda, uni taklif qilgan odamga bonus beradi."""
     if not user.referred_by:
         return
 
-    # avval to'ldirganmi yoki yo'qmi - shu to'ldirishdan OLDINGI holatga qaraymiz
-    is_first_topup = user.total_topped_up == topup_amount  # balans shu to'lovdan oldin 0 bo'lgan bo'lsa
+    is_first_topup = user.total_topped_up == topup_amount  # to'lovdan oldin 0 bo'lgan bo'lsa
 
     if not is_first_topup:
         return
@@ -142,6 +146,41 @@ async def apply_referral_bonus_if_first_topup(session: AsyncSession, user: User,
     await session.commit()
 
 
+# ---------- UMUMIY SOZLAMALAR (matnlar va h.k.) ----------
+
+DEFAULT_TEXTS = {
+    "card_info": "💳 0000 0000 0000 0000",
+    "help_text": (
+        "🆘 <b>Yordam</b>\n\n"
+        "Savol yoki muammo bo'lsa, admin bilan bog'laning.\n"
+        "Buyurtmangiz holatini \"🧾 Buyurtmalarim\" bo'limidan kuzatishingiz mumkin."
+    ),
+    "welcome_text": "✅ Xush kelibsiz! Botdan to'liq foydalanishingiz mumkin.",
+}
+
+TEXT_LABELS = {
+    "card_info": "💳 Karta ma'lumotlari",
+    "help_text": "🆘 Yordam matni",
+    "welcome_text": "👋 Salomlashuv matni",
+}
+
+
+async def get_text(session: AsyncSession, key: str) -> str:
+    setting = await session.get(Setting, key)
+    if setting:
+        return setting.value
+    return DEFAULT_TEXTS.get(key, "")
+
+
+async def set_text(session: AsyncSession, key: str, value: str) -> None:
+    setting = await session.get(Setting, key)
+    if setting:
+        setting.value = value
+    else:
+        session.add(Setting(key=key, value=value))
+    await session.commit()
+
+
 # ---------- KATALOG ----------
 
 async def get_active_products(session: AsyncSession) -> Sequence[BotProduct]:
@@ -151,16 +190,42 @@ async def get_active_products(session: AsyncSession) -> Sequence[BotProduct]:
     return result.scalars().all()
 
 
+async def get_all_products(session: AsyncSession) -> Sequence[BotProduct]:
+    result = await session.execute(select(BotProduct).order_by(BotProduct.id))
+    return result.scalars().all()
+
+
 async def get_product(session: AsyncSession, product_id: int) -> Optional[BotProduct]:
     return await session.get(BotProduct, product_id)
 
 
 async def add_product(
-    session: AsyncSession, name: str, description: str, price: float, category: Optional[str] = None
+    session: AsyncSession,
+    name: str,
+    description: str,
+    price: float,
+    category: Optional[str] = None,
+    media_file_id: Optional[str] = None,
+    media_type: Optional[str] = None,
 ) -> BotProduct:
-    product = BotProduct(name=name, description=description, price=price, category=category)
+    product = BotProduct(
+        name=name,
+        description=description,
+        price=price,
+        category=category,
+        media_file_id=media_file_id,
+        media_type=media_type,
+    )
     session.add(product)
     await session.commit()
+    return product
+
+
+async def update_product_field(session: AsyncSession, product_id: int, field: str, value) -> Optional[BotProduct]:
+    product = await session.get(BotProduct, product_id)
+    if product and hasattr(product, field):
+        setattr(product, field, value)
+        await session.commit()
     return product
 
 
@@ -172,20 +237,50 @@ async def toggle_product(session: AsyncSession, product_id: int) -> Optional[Bot
     return product
 
 
+async def delete_product(session: AsyncSession, product_id: int) -> str:
+    """Mahsulotni butunlay o'chirishga urinadi. Agar unga buyurtmalar bog'liq bo'lsa,
+    o'rniga faqat yashiradi (deaktiv qiladi). Natija: "deleted" yoki "deactivated"."""
+    product = await session.get(BotProduct, product_id)
+    if not product:
+        return "not_found"
+    try:
+        await session.delete(product)
+        await session.commit()
+        return "deleted"
+    except IntegrityError:
+        await session.rollback()
+        product = await session.get(BotProduct, product_id)
+        product.is_active = False
+        await session.commit()
+        return "deactivated"
+
+
 # ---------- BUYURTMALAR ----------
 
-async def create_order(session: AsyncSession, user_id: int, product: BotProduct) -> Order:
+async def create_order(
+    session: AsyncSession,
+    user_id: int,
+    product: BotProduct,
+    custom_nickname: Optional[str] = None,
+    custom_username: Optional[str] = None,
+) -> Order:
     deadline = datetime.utcnow() + timedelta(hours=ORDER_DEADLINE_HOURS)
     order = Order(
         user_id=user_id,
         product_id=product.id,
         product_name=product.name,
         price=product.price,
+        custom_nickname=custom_nickname,
+        custom_username=custom_username,
         deadline=deadline,
     )
     session.add(order)
     await session.commit()
     return order
+
+
+async def get_order(session: AsyncSession, order_id: int) -> Optional[Order]:
+    return await session.get(Order, order_id)
 
 
 async def get_user_orders(session: AsyncSession, user_id: int) -> Sequence[Order]:
@@ -195,9 +290,10 @@ async def get_user_orders(session: AsyncSession, user_id: int) -> Sequence[Order
     return result.scalars().all()
 
 
-async def get_orders_by_status(session: AsyncSession, status: str) -> Sequence[Order]:
+async def get_active_orders(session: AsyncSession) -> Sequence[Order]:
+    """Admin uchun: hali yakunlanmagan (pending yoki in_progress) buyurtmalar."""
     result = await session.execute(
-        select(Order).where(Order.status == status).order_by(Order.created_at)
+        select(Order).where(Order.status.in_(["pending", "in_progress"])).order_by(Order.created_at)
     )
     return result.scalars().all()
 
@@ -212,6 +308,49 @@ async def update_order_status(
             order.admin_note = admin_note
         await session.commit()
     return order
+
+
+# ---------- TO'LOV (TOPUP) SO'ROVLARI ----------
+
+async def create_topup_request(
+    session: AsyncSession, user_id: int, amount: float, receipt_file_id: Optional[str] = None
+) -> TopupRequest:
+    req = TopupRequest(user_id=user_id, amount=amount, receipt_file_id=receipt_file_id)
+    session.add(req)
+    await session.commit()
+    return req
+
+
+async def get_topup_request(session: AsyncSession, request_id: int) -> Optional[TopupRequest]:
+    return await session.get(TopupRequest, request_id)
+
+
+async def get_pending_topup_requests(session: AsyncSession) -> Sequence[TopupRequest]:
+    result = await session.execute(
+        select(TopupRequest).where(TopupRequest.status == "pending").order_by(TopupRequest.created_at)
+    )
+    return result.scalars().all()
+
+
+async def process_topup_request(
+    session: AsyncSession, request_id: int, approve: bool, admin_id: int
+) -> Optional[TopupRequest]:
+    req = await session.get(TopupRequest, request_id)
+    if not req or req.status != "pending":
+        return req
+
+    req.status = "approved" if approve else "rejected"
+    req.processed_at = datetime.utcnow()
+    req.processed_by = admin_id
+    await session.commit()
+
+    if approve:
+        await adjust_balance(session, req.user_id, req.amount, "topup", description=f"To'lov so'rovi #{req.id}")
+        user = await get_user(session, req.user_id)
+        if user:
+            await apply_referral_bonus_if_first_topup(session, user, req.amount)
+
+    return req
 
 
 # ---------- MAJBURIY OBUNALAR ----------
@@ -264,6 +403,41 @@ async def is_subscription_confirmed(session: AsyncSession, user_id: int, sub_id:
     return result.scalar_one_or_none() is not None
 
 
+# ---------- ADMINLAR ----------
+
+async def is_user_admin(session: AsyncSession, user_id: int) -> bool:
+    if user_id in ADMIN_IDS:
+        return True
+    user = await session.get(User, user_id)
+    return bool(user and user.is_admin)
+
+
+async def add_admin(session: AsyncSession, user_id: int) -> Optional[User]:
+    user = await session.get(User, user_id)
+    if not user:
+        return None
+    user.is_admin = True
+    await session.commit()
+    return user
+
+
+async def remove_admin(session: AsyncSession, user_id: int) -> bool:
+    """DB orqali qo'shilgan adminni olib tashlaydi. ENV (asosiy) adminlarni olib tashlab bo'lmaydi."""
+    if user_id in ADMIN_IDS:
+        return False
+    user = await session.get(User, user_id)
+    if user and user.is_admin:
+        user.is_admin = False
+        await session.commit()
+        return True
+    return False
+
+
+async def get_db_admins(session: AsyncSession) -> Sequence[User]:
+    result = await session.execute(select(User).where(User.is_admin == True))  # noqa: E712
+    return result.scalars().all()
+
+
 # ---------- STATISTIKA ----------
 
 async def get_stats(session: AsyncSession) -> dict:
@@ -272,6 +446,7 @@ async def get_stats(session: AsyncSession) -> dict:
     total_topup = await session.scalar(select(func.sum(User.total_topped_up))) or 0
     total_orders = await session.scalar(select(func.count(Order.id)))
     pending_orders = await session.scalar(select(func.count(Order.id)).where(Order.status == "pending"))
+    in_progress_orders = await session.scalar(select(func.count(Order.id)).where(Order.status == "in_progress"))
     done_orders = await session.scalar(select(func.count(Order.id)).where(Order.status == "done"))
 
     today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
@@ -284,5 +459,6 @@ async def get_stats(session: AsyncSession) -> dict:
         "total_topup": total_topup,
         "total_orders": total_orders or 0,
         "pending_orders": pending_orders or 0,
+        "in_progress_orders": in_progress_orders or 0,
         "done_orders": done_orders or 0,
     }

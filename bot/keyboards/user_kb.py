@@ -23,16 +23,22 @@ def phone_request_kb() -> ReplyKeyboardMarkup:
     return builder.as_markup(resize_keyboard=True, one_time_keyboard=True)
 
 
+def cancel_kb() -> ReplyKeyboardMarkup:
+    builder = ReplyKeyboardBuilder()
+    builder.row(KeyboardButton(text="❌ Bekor qilish"))
+    return builder.as_markup(resize_keyboard=True, one_time_keyboard=True)
+
+
 def subscriptions_kb(subs: list[MandatorySubscription]) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    for sub in subs:
+    for i, sub in enumerate(subs, start=1):
         icon = {
             "telegram_join": "✈️",
             "telegram_request": "✈️",
             "instagram": "📸",
             "youtube": "▶️",
         }.get(sub.platform, "🔗")
-        builder.row(InlineKeyboardButton(text=f"{icon} {sub.title}", url=sub.url))
+        builder.row(InlineKeyboardButton(text=f"{i}. {icon} {sub.title}", url=sub.url))
 
         if sub.platform in ("telegram_request", "instagram", "youtube"):
             label = "✅ Zayavka tashladim" if sub.platform == "telegram_request" else "✅ Bajardim"
@@ -52,7 +58,7 @@ def catalog_kb(products: list[BotProduct]) -> InlineKeyboardMarkup:
 def product_detail_kb(product_id: int) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text="🛒 Buyurtma berish", callback_data=f"order:{product_id}"))
-    builder.row(InlineKeyboardButton(text="⬅️ Orqaga", callback_data="back_to_catalog"))
+    builder.row(InlineKeyboardButton(text="⬅️ Katalogga qaytish", callback_data="back_to_catalog"))
     return builder.as_markup()
 
 
@@ -71,4 +77,11 @@ def topup_amount_kb() -> InlineKeyboardMarkup:
     for a in amounts:
         builder.button(text=f"{a:,.0f} so'm", callback_data=f"topup:{a}")
     builder.adjust(2)
+    builder.row(InlineKeyboardButton(text="✏️ Boshqa summa kiritish", callback_data="topup_custom"))
     return builder.as_markup()
+
+
+def skip_media_kb() -> ReplyKeyboardMarkup:
+    builder = ReplyKeyboardBuilder()
+    builder.row(KeyboardButton(text="➡️ O'tkazib yuborish"))
+    return builder.as_markup(resize_keyboard=True, one_time_keyboard=True)

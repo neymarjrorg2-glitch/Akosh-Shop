@@ -6,8 +6,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import ADMIN_IDS
 from bot.database import crud
+from bot.database.crud import MIN_TOPUP_AMOUNT
 from bot.keyboards import user_kb
-from bot.utils.states import OrderFlow
+from bot.utils.states import OrderFlow, TopupFlow
 from bot.utils.subscription_check import check_all_subscriptions
 
 router = Router(name="user")
@@ -16,7 +17,9 @@ router = Router(name="user")
 # ---------- START ----------
 
 @router.message(CommandStart())
-async def cmd_start(message: Message, command: CommandObject, session: AsyncSession, bot: Bot):
+async def cmd_start(message: Message, command: CommandObject, session: AsyncSession, bot: Bot, state: FSMContext):
+    await state.clear()
+
     referred_by = None
     if command.args and command.args.isdigit():
         referred_by = int(command.args)
@@ -44,14 +47,13 @@ async def show_subscription_gate_or_menu(message: Message, session: AsyncSession
         if user and not user.subscriptions_verified:
             user.subscriptions_verified = True
             await session.commit()
-        await message.answer(
-            "✅ Xush kelibsiz! Botdan to'liq foydalanishingiz mumkin.",
-            reply_markup=user_kb.main_menu_kb(),
-        )
+        welcome_text = await crud.get_text(session, "welcome_text")
+        await message.answer(welcome_text, reply_markup=user_kb.main_menu_kb())
     else:
         await message.answer(
-            "📢 Botdan foydalanish uchun quyidagilarni bajaring:\n\n"
-            "Har birini bosing, so'ng pastdagi <b>\"🔄 Tekshirish\"</b> tugmasini bosing.",
+            "📢 <b>Botdan foydalanish uchun quyidagi shartlarni bajaring:</b>\n\n"
+            "Har bir havolani bosing, so'ng kerak bo'lsa tasdiqlash tugmasini bosing.\n"
+            "Hammasi bajarilgach — pastdagi <b>\"🔄 Tekshirish\"</b> tugmasini bosing.",
             reply_markup=user_kb.subscriptions_kb(pending),
         )
 
@@ -91,7 +93,6 @@ async def cb_confirm_sub(callback: CallbackQuery, session: AsyncSession, bot: Bo
 
 
 async def _require_subscription(message: Message, session: AsyncSession, bot: Bot) -> bool:
-    """True qaytarsa - foydalanuvchi davom etishi mumkin. False bo'lsa, obuna talab qilingan."""
     all_ok, pending = await check_all_subscriptions(bot, session, message.from_user.id)
     if not all_ok:
         await message.answer(
@@ -117,6 +118,14 @@ async def show_catalog(message: Message, session: AsyncSession, bot: Bot):
     await message.answer("🤖 <b>Mavjud botlar:</b>", reply_markup=user_kb.catalog_kb(products))
 
 
+def _product_caption(product) -> str:
+    return (
+        f"🤖 <b>{product.name}</b>\n\n"
+        f"{product.description}\n\n"
+        f"💵 Narxi: <b>{product.price:,.0f} so'm</b>"
+    )
+
+
 @router.callback_query(F.data.startswith("product:"))
 async def show_product(callback: CallbackQuery, session: AsyncSession):
     product_id = int(callback.data.split(":")[1])
@@ -125,70 +134,98 @@ async def show_product(callback: CallbackQuery, session: AsyncSession):
         await callback.answer("Bu mahsulot mavjud emas.", show_alert=True)
         return
 
-    text = (
-        f"🤖 <b>{product.name}</b>\n\n"
-        f"{product.description}\n\n"
-        f"💵 Narxi: <b>{product.price:,.0f} so'm</b>"
-    )
-    await callback.message.edit_text(text, reply_markup=user_kb.product_detail_kb(product.id))
+    caption = _product_caption(product)
+    kb = user_kb.product_detail_kb(product.id)
+
+    if product.media_file_id and product.media_type == "photo":
+        await callback.message.answer_photo(product.media_file_id, caption=caption, reply_markup=kb)
+    elif product.media_file_id and product.media_type == "video":
+        await callback.message.answer_video(product.media_file_id, caption=caption, reply_markup=kb)
+    else:
+        await callback.message.answer(caption, reply_markup=kb)
+    await callback.answer()
 
 
 @router.callback_query(F.data == "back_to_catalog")
 async def back_to_catalog(callback: CallbackQuery, session: AsyncSession):
     products = await crud.get_active_products(session)
-    await callback.message.edit_text("🤖 <b>Mavjud botlar:</b>", reply_markup=user_kb.catalog_kb(products))
-
-
-# ---------- BUYURTMA ----------
-
-@router.callback_query(F.data.startswith("order:"))
-async def start_order(callback: CallbackQuery, session: AsyncSession, state: FSMContext):
-    product_id = int(callback.data.split(":")[1])
-    user = await crud.get_user(session, callback.from_user.id)
-
-    if not user.phone:
-        await state.update_data(pending_product_id=product_id)
-        await state.set_state(OrderFlow.waiting_phone)
-        await callback.message.answer(
-            "📱 Buyurtma berish uchun avval telefon raqamingizni ulashing:",
-            reply_markup=user_kb.phone_request_kb(),
-        )
-        await callback.answer()
-        return
-
-    await _ask_order_confirmation(callback.message, session, product_id)
+    await callback.message.answer("🤖 <b>Mavjud botlar:</b>", reply_markup=user_kb.catalog_kb(products))
     await callback.answer()
 
 
-async def _ask_order_confirmation(message: Message, session: AsyncSession, product_id: int):
+# ---------- BUYURTMA (bot nomi + username so'raladi) ----------
+
+@router.callback_query(F.data.startswith("order:"))
+async def start_order(callback: CallbackQuery, state: FSMContext):
+    product_id = int(callback.data.split(":")[1])
+    await state.update_data(pending_product_id=product_id)
+    await state.set_state(OrderFlow.waiting_bot_name)
+    await callback.message.answer(
+        "🤖 Botingiz uchun xohlagan <b>NOM</b>ni kiriting (masalan: \"Mening Do'konim\"):",
+        reply_markup=user_kb.cancel_kb(),
+    )
+    await callback.answer()
+
+
+@router.message(F.text == "❌ Bekor qilish")
+async def cancel_any_flow(message: Message, state: FSMContext):
+    current = await state.get_state()
+    if current:
+        await state.clear()
+        await message.answer("Bekor qilindi.", reply_markup=user_kb.main_menu_kb())
+
+
+@router.message(OrderFlow.waiting_bot_name)
+async def order_bot_name(message: Message, state: FSMContext):
+    if not message.text:
+        await message.answer("Iltimos, matn ko'rinishida kiriting.")
+        return
+    await state.update_data(bot_name=message.text.strip())
+    await state.set_state(OrderFlow.waiting_bot_username)
+    await message.answer(
+        "🔤 Endi botingiz uchun xohlagan <b>USERNAME</b>ni kiriting "
+        "(masalan: \"mening_dokonim_bot\"):",
+        reply_markup=user_kb.cancel_kb(),
+    )
+
+
+@router.message(OrderFlow.waiting_bot_username)
+async def order_bot_username(message: Message, state: FSMContext, session: AsyncSession):
+    if not message.text:
+        await message.answer("Iltimos, matn ko'rinishida kiriting.")
+        return
+
+    data = await state.get_data()
+    product_id = data.get("pending_product_id")
+    bot_name = data.get("bot_name")
+    bot_username = message.text.strip()
+    await state.clear()
+
     product = await crud.get_product(session, product_id)
     if not product:
-        await message.answer("Bu mahsulot topilmadi.")
+        await message.answer("Bu mahsulot topilmadi.", reply_markup=user_kb.main_menu_kb())
         return
+
+    await state.update_data(bot_name=bot_name, bot_username=bot_username, pending_product_id=product_id)
     await message.answer(
-        f"🛒 <b>{product.name}</b> — {product.price:,.0f} so'm\n\nBuyurtmani tasdiqlaysizmi?",
+        f"🛒 <b>{product.name}</b> — {product.price:,.0f} so'm\n\n"
+        f"🤖 Bot nomi: {bot_name}\n"
+        f"🔤 Username: {bot_username}\n\n"
+        f"Buyurtmani tasdiqlaysizmi?",
         reply_markup=user_kb.confirm_order_kb(product.id),
     )
 
 
-@router.message(OrderFlow.waiting_phone, F.contact)
-async def phone_received(message: Message, session: AsyncSession, state: FSMContext):
-    await crud.set_phone(session, message.from_user.id, message.contact.phone_number)
-    await message.answer("✅ Raqam qabul qilindi.", reply_markup=user_kb.main_menu_kb())
-
-    data = await state.get_data()
-    product_id = data.get("pending_product_id")
-    await state.clear()
-
-    if product_id:
-        await _ask_order_confirmation(message, session, product_id)
-
-
 @router.callback_query(F.data.startswith("confirm_order:"))
-async def confirm_order(callback: CallbackQuery, session: AsyncSession, bot: Bot):
+async def confirm_order(callback: CallbackQuery, session: AsyncSession, bot: Bot, state: FSMContext):
     product_id = int(callback.data.split(":")[1])
     product = await crud.get_product(session, product_id)
     user = await crud.get_user(session, callback.from_user.id)
+
+    data = await state.get_data()
+    bot_name = data.get("bot_name")
+    bot_username = data.get("bot_username")
+    await state.clear()
 
     if not product or not product.is_active:
         await callback.answer("Bu mahsulot endi mavjud emas.", show_alert=True)
@@ -208,30 +245,32 @@ async def confirm_order(callback: CallbackQuery, session: AsyncSession, bot: Bot
     await crud.adjust_balance(
         session, user.id, -product.price, "order_payment", description=f"Buyurtma: {product.name}"
     )
-    order = await crud.create_order(session, user.id, product)
+    order = await crud.create_order(
+        session, user.id, product, custom_nickname=bot_name, custom_username=bot_username
+    )
 
     await callback.message.edit_text(
-        f"✅ Buyurtmangiz qabul qilindi!\n\n"
+        f"✅ Buyurtmangiz qabul qilindi! #{order.id}\n\n"
         f"🤖 {product.name}\n"
         f"💵 {product.price:,.0f} so'm\n"
         f"⏳ Bajarilish muddati: 24 soat ichida\n\n"
         f"Admin tez orada siz bilan bog'lanadi."
     )
 
-    # Adminlarga xabar
     admin_text = (
         f"🆕 <b>Yangi buyurtma #{order.id}</b>\n\n"
         f"👤 Mijoz: {user.full_name} (@{user.username or '—'})\n"
         f"🆔 ID: <code>{user.id}</code>\n"
-        f"📱 Tel: {user.phone or '—'}\n"
         f"🤖 Mahsulot: {product.name}\n"
-        f"💵 Narx: {product.price:,.0f} so'm"
+        f"💵 Narx: {product.price:,.0f} so'm\n\n"
+        f"🏷 Bot nomi: {bot_name}\n"
+        f"🔤 Bot username: {bot_username}"
     )
     from bot.keyboards.admin_kb import order_status_kb
 
     for admin_id in ADMIN_IDS:
         try:
-            await bot.send_message(admin_id, admin_text, reply_markup=order_status_kb(order.id))
+            await bot.send_message(admin_id, admin_text, reply_markup=order_status_kb(order.id, order.status))
         except Exception:
             pass
 
@@ -272,12 +311,22 @@ async def show_orders(message: Message, session: AsyncSession):
         await message.answer("Sizda hali buyurtmalar yo'q.")
         return
 
-    lines = ["🧾 <b>Buyurtmalaringiz:</b>\n"]
     for o in orders:
-        lines.append(
-            f"#{o.id} — {o.product_name} — {o.price:,.0f} so'm — {STATUS_LABELS.get(o.status, o.status)}"
+        text = (
+            f"🧾 <b>Buyurtma #{o.id}</b>\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"🤖 Mahsulot: {o.product_name}\n"
+            f"💵 Narx: {o.price:,.0f} so'm\n"
         )
-    await message.answer("\n".join(lines))
+        if o.custom_nickname:
+            text += f"🏷 Bot nomi: {o.custom_nickname}\n"
+        if o.custom_username:
+            text += f"🔤 Username: {o.custom_username}\n"
+        text += (
+            f"📅 Sana: {o.created_at.strftime('%d.%m.%Y %H:%M')}\n"
+            f"📌 Holat: {STATUS_LABELS.get(o.status, o.status)}"
+        )
+        await message.answer(text)
 
 
 # ---------- REFERRAL ----------
@@ -291,7 +340,7 @@ async def show_referral(message: Message, session: AsyncSession, bot: Bot):
 
     text = (
         f"👥 <b>Referral tizimi</b>\n\n"
-        f"Do'stlaringizni taklif qiling va ular balans to'ldirganda "
+        f"Do'stlaringizni taklif qiling va ular birinchi marta balans to'ldirganda "
         f"<b>{percent:.0f}%</b> bonus oling!\n\n"
         f"🔗 Sizning havolangiz:\n<code>{link}</code>\n\n"
         f"👤 Takliflar: {user.referral_count} ta\n"
@@ -303,44 +352,99 @@ async def show_referral(message: Message, session: AsyncSession, bot: Bot):
 # ---------- BALANS TO'LDIRISH ----------
 
 @router.message(F.text == "💳 Balans to'ldirish")
-async def show_topup(message: Message):
+async def show_topup(message: Message, state: FSMContext):
+    await state.clear()
     await message.answer(
-        "💳 Balansni to'ldirish uchun miqdorni tanlang.\n\n"
-        "To'lov qilingandan so'ng, chekni admin bilan ulashing — balans qo'lda tasdiqlangach hisobingizga tushadi.",
+        f"💳 Balansni to'ldirish uchun miqdorni tanlang (minimal {MIN_TOPUP_AMOUNT:,.0f} so'm):",
         reply_markup=user_kb.topup_amount_kb(),
     )
 
 
+@router.callback_query(F.data == "topup_custom")
+async def topup_custom_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(TopupFlow.waiting_custom_amount)
+    await callback.message.answer(
+        f"✏️ To'ldirmoqchi bo'lgan summani kiriting (minimal {MIN_TOPUP_AMOUNT:,.0f} so'm):",
+        reply_markup=user_kb.cancel_kb(),
+    )
+    await callback.answer()
+
+
+@router.message(TopupFlow.waiting_custom_amount)
+async def topup_custom_amount(message: Message, state: FSMContext, session: AsyncSession):
+    if not message.text or not message.text.replace(" ", "").isdigit():
+        await message.answer("❗️ Iltimos, faqat raqam kiriting.")
+        return
+
+    amount = float(message.text.replace(" ", ""))
+    if amount < MIN_TOPUP_AMOUNT:
+        await message.answer(f"❗️ Minimal miqdor {MIN_TOPUP_AMOUNT:,.0f} so'm. Qaytadan kiriting:")
+        return
+
+    await _start_topup_payment(message, state, session, amount)
+
+
 @router.callback_query(F.data.startswith("topup:"))
-async def request_topup(callback: CallbackQuery, bot: Bot):
-    amount = int(callback.data.split(":")[1])
-    await callback.message.edit_text(
-        f"💳 Siz <b>{amount:,.0f} so'm</b> miqdorida to'ldirishni tanladingiz.\n\n"
-        f"Quyidagi karta raqamiga o'tkazma qiling, so'ng chekni shu botga (yoki adminga) yuboring:\n\n"
-        f"💳 <code>0000 0000 0000 0000</code>\n\n"
-        f"To'lov tasdiqlangach, balansingiz avtomatik yangilanadi."
+async def request_topup(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
+    amount = float(callback.data.split(":")[1])
+    await callback.answer()
+    await _start_topup_payment(callback.message, state, session, amount)
+
+
+async def _start_topup_payment(message: Message, state: FSMContext, session: AsyncSession, amount: float):
+    card_info = await crud.get_text(session, "card_info")
+    await state.update_data(topup_amount=amount)
+    await state.set_state(TopupFlow.waiting_receipt)
+    await message.answer(
+        f"💳 <b>{amount:,.0f} so'm</b> miqdorida to'ldirishni tanladingiz.\n\n"
+        f"Quyidagi karta raqamiga o'tkazma qiling:\n\n{card_info}\n\n"
+        f"✅ To'lovni amalga oshirgach, <b>chek rasmini shu yerga yuboring</b> — "
+        f"admin tasdiqlagach, balansingiz avtomatik yangilanadi.",
+        reply_markup=user_kb.cancel_kb(),
+    )
+
+
+@router.message(TopupFlow.waiting_receipt, F.photo)
+async def topup_receipt_received(message: Message, state: FSMContext, session: AsyncSession, bot: Bot):
+    data = await state.get_data()
+    amount = data.get("topup_amount")
+    await state.clear()
+
+    if not amount:
+        await message.answer("Xatolik yuz berdi, qaytadan urinib ko'ring.", reply_markup=user_kb.main_menu_kb())
+        return
+
+    receipt_file_id = message.photo[-1].file_id
+    req = await crud.create_topup_request(session, message.from_user.id, amount, receipt_file_id)
+
+    await message.answer(
+        "✅ Chekingiz qabul qilindi! Admin tekshirgach, balansingiz yangilanadi.",
+        reply_markup=user_kb.main_menu_kb(),
+    )
+
+    from bot.keyboards.admin_kb import topup_confirm_kb
+
+    caption = (
+        f"💳 <b>Yangi to'lov so'rovi #{req.id}</b>\n\n"
+        f"👤 {message.from_user.full_name} (@{message.from_user.username or '—'})\n"
+        f"🆔 ID: <code>{message.from_user.id}</code>\n"
+        f"💵 Miqdor: {amount:,.0f} so'm"
     )
     for admin_id in ADMIN_IDS:
         try:
-            await bot.send_message(
-                admin_id,
-                f"💳 <b>To'ldirish so'rovi</b>\n\n"
-                f"👤 {callback.from_user.full_name} (@{callback.from_user.username or '—'})\n"
-                f"🆔 ID: <code>{callback.from_user.id}</code>\n"
-                f"💵 Miqdor: {amount:,.0f} so'm\n\n"
-                f"Tasdiqlash uchun: \"💰 Balans boshqarish\" bo'limidan foydalaning.",
-            )
+            await bot.send_photo(admin_id, receipt_file_id, caption=caption, reply_markup=topup_confirm_kb(req.id))
         except Exception:
             pass
-    await callback.answer()
+
+
+@router.message(TopupFlow.waiting_receipt)
+async def topup_receipt_not_photo(message: Message):
+    await message.answer("📸 Iltimos, to'lov chekining RASMINI yuboring.")
 
 
 # ---------- YORDAM ----------
 
 @router.message(F.text == "🆘 Yordam")
-async def show_help(message: Message):
-    await message.answer(
-        "🆘 <b>Yordam</b>\n\n"
-        "Savol yoki muammo bo'lsa, quyidagi admin bilan bog'laning.\n"
-        "Buyurtmangiz holatini \"🧾 Buyurtmalarim\" bo'limidan kuzatishingiz mumkin."
-    )
+async def show_help(message: Message, session: AsyncSession):
+    text = await crud.get_text(session, "help_text")
+    await message.answer(text)
