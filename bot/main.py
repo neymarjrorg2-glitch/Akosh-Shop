@@ -5,6 +5,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import ErrorEvent
 
 from bot.config import BOT_TOKEN
 from bot.database.engine import init_db
@@ -33,9 +34,17 @@ async def main() -> None:
     dp.include_router(admin_handlers.router)
     dp.include_router(user_handlers.router)
 
+    @dp.errors()
+    async def global_error_handler(event: ErrorEvent) -> bool:
+        """Har qanday kutilmagan xatoni log qiladi, lekin BOTNI TO'XTATMAYDI.
+        Shu tufayli bitta foydalanuvchida chiqqan xato boshqa hamma foydalanuvchilarga
+        ta'sir qilmaydi - bot "qotib qolish" o'rniga ishlashda davom etadi."""
+        logger.exception("Xatolik yuz berdi: %s", event.exception, exc_info=event.exception)
+        return True
+
     logger.info("Bot ishga tushdi.")
     await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    await dp.start_polling(bot, handle_signals=True)
 
 
 if __name__ == "__main__":

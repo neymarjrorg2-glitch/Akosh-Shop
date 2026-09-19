@@ -3,6 +3,7 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.types import Message, CallbackQuery
 from sqlalchemy.ext.asyncio import AsyncSession
+import asyncio
 
 from bot.config import ADMIN_IDS
 from bot.database import crud
@@ -38,15 +39,6 @@ async def back_to_user_menu(message: Message, session: AsyncSession):
     if not await require_admin(message.from_user.id, session):
         return
     await message.answer("Asosiy menyu 👇", reply_markup=user_kb.main_menu_kb())
-
-
-@router.message(F.text == "❌ Bekor qilish")
-async def admin_cancel(message: Message, state: FSMContext, session: AsyncSession):
-    if not await require_admin(message.from_user.id, session):
-        return
-    if await state.get_state():
-        await state.clear()
-        await message.answer("Bekor qilindi.", reply_markup=admin_kb.admin_menu_kb())
 
 
 # ---------- STATISTIKA ----------
@@ -814,6 +806,7 @@ async def broadcast_send(message: Message, state: FSMContext, session: AsyncSess
             sent += 1
         except Exception:
             failed += 1
+        await asyncio.sleep(0.05)  # Telegram flood-control'ga tushib qolmaslik uchun (~20 xabar/soniya)
         if i % 25 == 0:
             try:
                 await status_msg.edit_text(f"📤 Yuborilmoqda... ({i}/{len(user_ids)})")

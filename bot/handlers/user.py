@@ -168,10 +168,15 @@ async def start_order(callback: CallbackQuery, state: FSMContext):
 
 
 @router.message(F.text == "❌ Bekor qilish")
-async def cancel_any_flow(message: Message, state: FSMContext):
+async def cancel_any_flow(message: Message, state: FSMContext, session: AsyncSession):
     current = await state.get_state()
-    if current:
-        await state.clear()
+    if not current:
+        return
+    await state.clear()
+    if await crud.is_user_admin(session, message.from_user.id):
+        from bot.keyboards import admin_kb
+        await message.answer("Bekor qilindi.", reply_markup=admin_kb.admin_menu_kb())
+    else:
         await message.answer("Bekor qilindi.", reply_markup=user_kb.main_menu_kb())
 
 
