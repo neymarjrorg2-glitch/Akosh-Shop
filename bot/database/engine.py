@@ -31,6 +31,7 @@ MIGRATIONS = [
     "ALTER TABLE orders ADD COLUMN IF NOT EXISTS custom_username VARCHAR(128)",
     "ALTER TABLE orders ALTER COLUMN product_id DROP NOT NULL",
     "ALTER TABLE settings ALTER COLUMN value TYPE TEXT",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_qualified BOOLEAN DEFAULT FALSE",
 ]
 
 

@@ -23,6 +23,7 @@ class User(Base):
     referred_by: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
     referral_earned: Mapped[float] = mapped_column(Float, default=0)
     referral_count: Mapped[int] = mapped_column(Integer, default=0)
+    referral_qualified: Mapped[bool] = mapped_column(Boolean, default=False)  # obuna+telefon tasdiqlaganmi
 
     is_blocked: Mapped[bool] = mapped_column(Boolean, default=False)
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False)  # DB orqali qo'shilgan qo'shimcha admin

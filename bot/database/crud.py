@@ -113,9 +113,27 @@ async def set_referral_percent(session: AsyncSession, percent: float) -> None:
     await session.commit()
 
 
+async def mark_referral_qualified(session: AsyncSession, user: User) -> Optional[User]:
+    """Foydalanuvchi majburiy obuna + telefon tasdiqlashni bajargach chaqiriladi.
+    Taklif qiluvchining referral_count'ini +1 qiladi (pul emas, faqat hisob).
+    Qaytaradi: taklif qiluvchi (agar bo'lsa), aks holda None."""
+    if not user.referred_by or user.referral_qualified:
+        return None
+
+    inviter = await session.get(User, user.referred_by)
+    if not inviter:
+        return None
+
+    user.referral_qualified = True
+    inviter.referral_count += 1
+    await session.commit()
+    return inviter
+
+
 async def apply_referral_bonus_if_first_topup(session: AsyncSession, user: User, topup_amount: float) -> None:
-    """Foydalanuvchi birinchi marta balans to'ldirganda, uni taklif qilgan odamga bonus beradi."""
-    if not user.referred_by:
+    """Foydalanuvchi birinchi marta balans to'ldirganda, uni taklif qilgan odamga PUL bonus beradi.
+    Faqat referral_qualified bo'lgan (obuna+telefonni tasdiqlagan) foydalanuvchilar uchun ishlaydi."""
+    if not user.referred_by or not user.referral_qualified:
         return
 
     is_first_topup = user.total_topped_up == topup_amount  # to'lovdan oldin 0 bo'lgan bo'lsa
@@ -134,7 +152,6 @@ async def apply_referral_bonus_if_first_topup(session: AsyncSession, user: User,
 
     inviter.balance += bonus
     inviter.referral_earned += bonus
-    inviter.referral_count += 1
     session.add(
         Transaction(
             user_id=inviter.id,

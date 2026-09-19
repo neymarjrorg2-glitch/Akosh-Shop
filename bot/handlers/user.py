@@ -8,7 +8,7 @@ from bot.config import ADMIN_IDS
 from bot.database import crud
 from bot.database.crud import MIN_TOPUP_AMOUNT
 from bot.keyboards import user_kb
-from bot.utils.states import OrderFlow, TopupFlow
+from bot.utils.states import OrderFlow, TopupFlow, Onboarding
 from bot.utils.subscription_check import check_all_subscriptions
 
 router = Router(name="user")
@@ -36,63 +36,117 @@ async def cmd_start(message: Message, command: CommandObject, session: AsyncSess
         await message.answer("⛔️ Siz botdan foydalanish huquqidan mahrum qilingansiz.")
         return
 
-    await show_subscription_gate_or_menu(message, session, bot, user_id=user.id)
+    # Yangi foydalanuvchi referal havola orqali kirgan bo'lsa - darhol taklif qiluvchiga xabar beramiz
+    if is_new and user.referred_by:
+        try:
+            await bot.send_message(
+                user.referred_by,
+                f"🆕 <b>Sizda yangi referal bor!</b>\n\n"
+                f"👤 {user.full_name or 'Foydalanuvchi'} botga sizning havolangiz orqali qo'shildi.\n\n"
+                f"⏳ Barcha shartlarni (majburiy obuna + telefon raqam tasdiqlash) bajarganidan so'ng, "
+                f"referal hisobingizga yoziladi.",
+            )
+        except Exception:
+            pass
+
+    await proceed_after_start(message, session, bot, state, user_id=user.id)
 
 
-async def show_subscription_gate_or_menu(message: Message, session: AsyncSession, bot: Bot, user_id: int):
+async def proceed_after_start(target: Message, session: AsyncSession, bot: Bot, state: FSMContext, user_id: int):
+    """Obuna -> telefon tasdiqlash -> asosiy menyu zanjirini boshqaradi."""
     all_ok, pending = await check_all_subscriptions(bot, session, user_id)
 
-    if all_ok:
-        user = await crud.get_user(session, user_id)
-        if user and not user.subscriptions_verified:
-            user.subscriptions_verified = True
-            await session.commit()
-        welcome_text = await crud.get_text(session, "welcome_text")
-        await message.answer(welcome_text, reply_markup=user_kb.main_menu_kb())
-    else:
-        await message.answer(
+    if not all_ok:
+        await target.answer(
             "📢 <b>Botdan foydalanish uchun quyidagi shartlarni bajaring:</b>\n\n"
             "Har bir havolani bosing, so'ng kerak bo'lsa tasdiqlash tugmasini bosing.\n"
             "Hammasi bajarilgach — pastdagi <b>\"🔄 Tekshirish\"</b> tugmasini bosing.",
             reply_markup=user_kb.subscriptions_kb(pending),
         )
+        return
+
+    user = await crud.get_user(session, user_id)
+    if user and not user.subscriptions_verified:
+        user.subscriptions_verified = True
+        await session.commit()
+
+    if user and not user.phone:
+        await state.set_state(Onboarding.waiting_phone)
+        await target.answer(
+            "✅ Barcha obunalar tasdiqlandi!\n\n"
+            "📱 Endi xavfsizlik uchun telefon raqamingizni tasdiqlang — "
+            "pastdagi tugmani bosing:",
+            reply_markup=user_kb.phone_request_kb(),
+        )
+        return
+
+    await show_main_menu(target, session)
+
+
+async def show_main_menu(target: Message, session: AsyncSession):
+    welcome_text = await crud.get_text(session, "welcome_text")
+    await target.answer(welcome_text, reply_markup=user_kb.main_menu_kb())
+
+
+@router.message(Onboarding.waiting_phone, F.contact)
+async def onboarding_phone_received(message: Message, state: FSMContext, session: AsyncSession, bot: Bot):
+    if message.contact.user_id != message.from_user.id:
+        await message.answer("❗️ Iltimos, FAQAT o'zingizning raqamingizni yuboring (boshqa odamning kontaktini emas).")
+        return
+
+    await crud.set_phone(session, message.from_user.id, message.contact.phone_number)
+    await state.clear()
+
+    user = await crud.get_user(session, message.from_user.id)
+    inviter = await crud.mark_referral_qualified(session, user)
+    if inviter:
+        try:
+            await bot.send_message(
+                inviter.id,
+                f"🎉 <b>Referalingiz shartlarni bajardi!</b>\n\n"
+                f"👤 {user.full_name or 'Foydalanuvchi'}\n\n"
+                f"✅ Referal hisobingizga yozildi! U birinchi marta balans to'ldirganda, "
+                f"sizga bonus tushadi.",
+            )
+        except Exception:
+            pass
+
+    await message.answer("✅ Raqam tasdiqlandi!")
+    await show_main_menu(message, session)
+
+
+@router.message(Onboarding.waiting_phone)
+async def onboarding_phone_not_contact(message: Message):
+    await message.answer("📱 Iltimos, pastdagi \"Raqamni yuborish\" tugmasini bosing (matn kiritish emas).")
 
 
 @router.callback_query(F.data == "check_subs")
-async def cb_check_subs(callback: CallbackQuery, session: AsyncSession, bot: Bot):
+async def cb_check_subs(callback: CallbackQuery, session: AsyncSession, bot: Bot, state: FSMContext):
     all_ok, pending = await check_all_subscriptions(bot, session, callback.from_user.id)
 
     if all_ok:
-        user = await crud.get_user(session, callback.from_user.id)
-        if user and not user.subscriptions_verified:
-            user.subscriptions_verified = True
-            await session.commit()
         await callback.message.edit_text("✅ Barcha shartlar bajarildi!")
-        await callback.message.answer("Asosiy menyu 👇", reply_markup=user_kb.main_menu_kb())
+        await proceed_after_start(callback.message, session, bot, state, user_id=callback.from_user.id)
     else:
         await callback.answer("❗️ Hali bajarilmagan shartlar bor.", show_alert=True)
         await callback.message.edit_reply_markup(reply_markup=user_kb.subscriptions_kb(pending))
 
 
 @router.callback_query(F.data.startswith("confirm_sub:"))
-async def cb_confirm_sub(callback: CallbackQuery, session: AsyncSession, bot: Bot):
+async def cb_confirm_sub(callback: CallbackQuery, session: AsyncSession, bot: Bot, state: FSMContext):
     sub_id = int(callback.data.split(":")[1])
     await crud.confirm_subscription(session, callback.from_user.id, sub_id)
     await callback.answer("✅ Qabul qilindi")
 
     all_ok, pending = await check_all_subscriptions(bot, session, callback.from_user.id)
     if all_ok:
-        user = await crud.get_user(session, callback.from_user.id)
-        if user and not user.subscriptions_verified:
-            user.subscriptions_verified = True
-            await session.commit()
         await callback.message.edit_text("✅ Barcha shartlar bajarildi!")
-        await callback.message.answer("Asosiy menyu 👇", reply_markup=user_kb.main_menu_kb())
+        await proceed_after_start(callback.message, session, bot, state, user_id=callback.from_user.id)
     else:
         await callback.message.edit_reply_markup(reply_markup=user_kb.subscriptions_kb(pending))
 
 
-async def _require_subscription(message: Message, session: AsyncSession, bot: Bot) -> bool:
+async def _require_subscription(message: Message, session: AsyncSession, bot: Bot, state: FSMContext) -> bool:
     all_ok, pending = await check_all_subscriptions(bot, session, message.from_user.id)
     if not all_ok:
         await message.answer(
@@ -100,14 +154,24 @@ async def _require_subscription(message: Message, session: AsyncSession, bot: Bo
             reply_markup=user_kb.subscriptions_kb(pending),
         )
         return False
+
+    user = await crud.get_user(session, message.from_user.id)
+    if user and not user.phone:
+        await state.set_state(Onboarding.waiting_phone)
+        await message.answer(
+            "📱 Davom etishdan oldin telefon raqamingizni tasdiqlang:",
+            reply_markup=user_kb.phone_request_kb(),
+        )
+        return False
+
     return True
 
 
 # ---------- KATALOG ----------
 
 @router.message(F.text == "🤖 Botlar katalogi")
-async def show_catalog(message: Message, session: AsyncSession, bot: Bot):
-    if not await _require_subscription(message, session, bot):
+async def show_catalog(message: Message, session: AsyncSession, bot: Bot, state: FSMContext):
+    if not await _require_subscription(message, session, bot, state):
         return
 
     products = await crud.get_active_products(session)

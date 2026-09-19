@@ -1,6 +1,10 @@
 from aiogram.fsm.state import State, StatesGroup
 
 
+class Onboarding(StatesGroup):
+    waiting_phone = State()  # majburiy obunadan keyin telefon tasdiqlash
+
+
 class OrderFlow(StatesGroup):
     waiting_bot_name = State()      # xohlagan bot nomi (nickname)
     waiting_bot_username = State()  # xohlagan bot username'i
