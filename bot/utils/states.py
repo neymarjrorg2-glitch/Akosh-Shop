@@ -6,8 +6,8 @@ class Onboarding(StatesGroup):
 
 
 class OrderFlow(StatesGroup):
-    waiting_bot_name = State()      # xohlagan bot nomi (nickname)
-    waiting_bot_username = State()  # xohlagan bot username'i
+    waiting_api_key = State()   # BotFather'dan olingan API key (token)
+    waiting_admin_id = State()  # shu bot uchun admin bo'ladigan Telegram ID
 
 
 class TopupFlow(StatesGroup):
@@ -19,6 +19,7 @@ class AdminAddProduct(StatesGroup):
     name = State()
     description = State()
     price = State()
+    hosting_price = State()
     category = State()
     media = State()
 
@@ -45,6 +46,7 @@ class AdminBroadcast(StatesGroup):
 class AdminManageUsers(StatesGroup):
     search_id = State()
     balance_amount = State()
+    message_text = State()  # shu foydalanuvchiga shaxsan yuboriladigan xabar
 
 
 class AdminManageAdmins(StatesGroup):

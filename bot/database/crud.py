@@ -1,3 +1,4 @@
+import calendar
 from datetime import datetime, timedelta
 from typing import Optional, Sequence
 
@@ -221,6 +222,7 @@ async def add_product(
     name: str,
     description: str,
     price: float,
+    hosting_price: float = 0,
     category: Optional[str] = None,
     media_file_id: Optional[str] = None,
     media_type: Optional[str] = None,
@@ -229,6 +231,7 @@ async def add_product(
         name=name,
         description=description,
         price=price,
+        hosting_price=hosting_price,
         category=category,
         media_file_id=media_file_id,
         media_type=media_type,
@@ -278,8 +281,7 @@ async def create_order(
     session: AsyncSession,
     user_id: int,
     product: BotProduct,
-    custom_nickname: Optional[str] = None,
-    custom_username: Optional[str] = None,
+    api_key: Optional[str] = None,
 ) -> Order:
     deadline = datetime.utcnow() + timedelta(hours=ORDER_DEADLINE_HOURS)
     order = Order(
@@ -287,8 +289,8 @@ async def create_order(
         product_id=product.id,
         product_name=product.name,
         price=product.price,
-        custom_nickname=custom_nickname,
-        custom_username=custom_username,
+        api_key=api_key,
+        hosting_price=product.hosting_price,
         deadline=deadline,
     )
     session.add(order)
@@ -296,8 +298,113 @@ async def create_order(
     return order
 
 
+def add_months(dt: datetime, months: int = 1) -> datetime:
+    """Berilgan sanaga N oy qo'shadi, oyning kunlar soni farqini hisobga oladi
+    (masalan 31-yanvar + 1 oy = 28/29-fevral)."""
+    month = dt.month - 1 + months
+    year = dt.year + month // 12
+    month = month % 12 + 1
+    day = min(dt.day, calendar.monthrange(year, month)[1])
+    return dt.replace(year=year, month=month, day=day)
+
+
+async def activate_hosting_on_done(session: AsyncSession, order: Order) -> None:
+    """Buyurtma 'bajarildi' deb belgilanganda, agar hosting narxi bo'lsa,
+    keyingi to'lov sanasini (1 oydan keyin) belgilaydi."""
+    if order.hosting_price and order.hosting_price > 0:
+        order.hosting_next_due = add_months(datetime.utcnow(), 1)
+        order.hosting_active = True
+        order.hosting_reminder_sent = False
+        await session.commit()
+
+
+async def renew_hosting(session: AsyncSession, order_id: int) -> Optional[Order]:
+    """Admin hosting to'lovi qilinganini qayd etganda chaqiriladi - muddatni 1 oyga uzaytiradi."""
+    order = await session.get(Order, order_id)
+    if not order:
+        return None
+    base = order.hosting_next_due if order.hosting_next_due and order.hosting_next_due > datetime.utcnow() else datetime.utcnow()
+    order.hosting_next_due = add_months(base, 1)
+    order.hosting_active = True
+    order.hosting_reminder_sent = False
+    await session.commit()
+    return order
+
+
+async def disable_hosting(session: AsyncSession, order_id: int) -> Optional[Order]:
+    order = await session.get(Order, order_id)
+    if order:
+        order.hosting_active = False
+        await session.commit()
+    return order
+
+
+async def get_orders_for_hosting_reminder(session: AsyncSession) -> Sequence[Order]:
+    """3 kun ichida to'lov muddati kelayotgan, hali eslatma yuborilmagan buyurtmalar."""
+    now = datetime.utcnow()
+    soon = now + timedelta(days=3)
+    result = await session.execute(
+        select(Order).where(
+            Order.hosting_active == True,  # noqa: E712
+            Order.hosting_reminder_sent == False,  # noqa: E712
+            Order.hosting_next_due.isnot(None),
+            Order.hosting_next_due <= soon,
+            Order.hosting_next_due > now,
+        )
+    )
+    return result.scalars().all()
+
+
+async def get_overdue_hosting_orders(session: AsyncSession) -> Sequence[Order]:
+    """Muddati o'tib ketgan, hali faol (uzilmagan) hosting buyurtmalari."""
+    now = datetime.utcnow()
+    result = await session.execute(
+        select(Order).where(
+            Order.hosting_active == True,  # noqa: E712
+            Order.hosting_next_due.isnot(None),
+            Order.hosting_next_due <= now,
+        )
+    )
+    return result.scalars().all()
+
+
+async def mark_hosting_reminder_sent(session: AsyncSession, order_id: int) -> None:
+    order = await session.get(Order, order_id)
+    if order:
+        order.hosting_reminder_sent = True
+        await session.commit()
+
+
+async def get_user_hosted_orders(session: AsyncSession, user_id: int) -> Sequence[Order]:
+    """Foydalanuvchining hosting narxi bor va bajarilgan buyurtmalari (uning "botlari")."""
+    result = await session.execute(
+        select(Order).where(
+            Order.user_id == user_id,
+            Order.status == "done",
+            Order.hosting_price > 0,
+        ).order_by(Order.created_at.desc())
+    )
+    return result.scalars().all()
+
+
 async def get_order(session: AsyncSession, order_id: int) -> Optional[Order]:
     return await session.get(Order, order_id)
+
+
+async def set_order_api_key(session: AsyncSession, order_id: int, api_key: str) -> Optional[Order]:
+    order = await session.get(Order, order_id)
+    if order:
+        order.api_key = api_key
+        await session.commit()
+    return order
+
+
+async def set_order_admin_id(session: AsyncSession, order_id: int, admin_telegram_id: str) -> Optional[Order]:
+    order = await session.get(Order, order_id)
+    if order:
+        order.admin_telegram_id = admin_telegram_id
+        await session.commit()
+    return order
 
 
 async def get_user_orders(session: AsyncSession, user_id: int) -> Sequence[Order]:

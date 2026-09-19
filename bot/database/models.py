@@ -39,6 +39,7 @@ class BotProduct(Base):
     name: Mapped[str] = mapped_column(String(128))
     description: Mapped[str] = mapped_column(Text)
     price: Mapped[float] = mapped_column(Float)
+    hosting_price: Mapped[float] = mapped_column(Float, default=0)  # oylik hosting narxi
     category: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
 
     # reklama uchun: rasm yoki video (<=60s)
@@ -58,9 +59,20 @@ class Order(Base):
     product_name: Mapped[str] = mapped_column(String(128))
     price: Mapped[float] = mapped_column(Float)
 
-    # foydalanuvchi o'zi xohlagan bot nomi va username'i (BotFather orqali sozlash uchun)
+    # foydalanuvchi o'zi BotFather orqali yaratgan botning API key (token)i
+    api_key: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    # shu bot uchun admin bo'ladigan Telegram ID (foydalanuvchi o'zi kiritadi)
+    admin_telegram_id: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+
+    # eski maydonlar (endi ishlatilmaydi, lekin ma'lumot yo'qolmasligi uchun saqlanadi)
     custom_nickname: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     custom_username: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+
+    # HOSTING: oylik to'lov tizimi
+    hosting_price: Mapped[float] = mapped_column(Float, default=0)  # buyurtma vaqtidagi hosting narxi
+    hosting_next_due: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)  # keyingi to'lov sanasi
+    hosting_active: Mapped[bool] = mapped_column(Boolean, default=True)  # hosting ulanganmi
+    hosting_reminder_sent: Mapped[bool] = mapped_column(Boolean, default=False)  # 3 kunlik eslatma yuborilganmi
 
     # pending -> in_progress -> done / cancelled
     status: Mapped[str] = mapped_column(String(32), default="pending")

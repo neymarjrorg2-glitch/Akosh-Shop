@@ -183,10 +183,14 @@ async def show_catalog(message: Message, session: AsyncSession, bot: Bot, state:
 
 
 def _product_caption(product) -> str:
+    hosting_line = (
+        f"\n🖥 Oylik hosting: <b>{product.hosting_price:,.0f} so'm/oy</b> (birinchi oy narxga kiritilgan)"
+        if product.hosting_price and product.hosting_price > 0 else ""
+    )
     return (
         f"🤖 <b>{product.name}</b>\n\n"
         f"{product.description}\n\n"
-        f"💵 Narxi: <b>{product.price:,.0f} so'm</b>"
+        f"💵 Narxi: <b>{product.price:,.0f} so'm</b>{hosting_line}"
     )
 
 
@@ -217,16 +221,24 @@ async def back_to_catalog(callback: CallbackQuery, session: AsyncSession):
     await callback.answer()
 
 
-# ---------- BUYURTMA (bot nomi + username so'raladi) ----------
+# ---------- BUYURTMA (tasdiqlash -> pul yechiladi -> API key so'raladi) ----------
 
 @router.callback_query(F.data.startswith("order:"))
-async def start_order(callback: CallbackQuery, state: FSMContext):
+async def start_order(callback: CallbackQuery, session: AsyncSession):
     product_id = int(callback.data.split(":")[1])
-    await state.update_data(pending_product_id=product_id)
-    await state.set_state(OrderFlow.waiting_bot_name)
+    product = await crud.get_product(session, product_id)
+    if not product or not product.is_active:
+        await callback.answer("Bu mahsulot mavjud emas.", show_alert=True)
+        return
+
+    hosting_note = (
+        f"\n💡 Oylik hosting narxi: {product.hosting_price:,.0f} so'm/oy "
+        f"(birinchi oy narxga kiritilgan)" if product.hosting_price and product.hosting_price > 0 else ""
+    )
     await callback.message.answer(
-        "🤖 Botingiz uchun xohlagan <b>NOM</b>ni kiriting (masalan: \"Mening Do'konim\"):",
-        reply_markup=user_kb.cancel_kb(),
+        f"🛒 <b>{product.name}</b> — {product.price:,.0f} so'm{hosting_note}\n\n"
+        f"Tasdiqlasangiz, balansingizdan {product.price:,.0f} so'm yechiladi. Davom etasizmi?",
+        reply_markup=user_kb.confirm_order_kb(product.id),
     )
     await callback.answer()
 
@@ -244,57 +256,11 @@ async def cancel_any_flow(message: Message, state: FSMContext, session: AsyncSes
         await message.answer("Bekor qilindi.", reply_markup=user_kb.main_menu_kb())
 
 
-@router.message(OrderFlow.waiting_bot_name)
-async def order_bot_name(message: Message, state: FSMContext):
-    if not message.text:
-        await message.answer("Iltimos, matn ko'rinishida kiriting.")
-        return
-    await state.update_data(bot_name=message.text.strip())
-    await state.set_state(OrderFlow.waiting_bot_username)
-    await message.answer(
-        "🔤 Endi botingiz uchun xohlagan <b>USERNAME</b>ni kiriting "
-        "(masalan: \"mening_dokonim_bot\"):",
-        reply_markup=user_kb.cancel_kb(),
-    )
-
-
-@router.message(OrderFlow.waiting_bot_username)
-async def order_bot_username(message: Message, state: FSMContext, session: AsyncSession):
-    if not message.text:
-        await message.answer("Iltimos, matn ko'rinishida kiriting.")
-        return
-
-    data = await state.get_data()
-    product_id = data.get("pending_product_id")
-    bot_name = data.get("bot_name")
-    bot_username = message.text.strip()
-    await state.clear()
-
-    product = await crud.get_product(session, product_id)
-    if not product:
-        await message.answer("Bu mahsulot topilmadi.", reply_markup=user_kb.main_menu_kb())
-        return
-
-    await state.update_data(bot_name=bot_name, bot_username=bot_username, pending_product_id=product_id)
-    await message.answer(
-        f"🛒 <b>{product.name}</b> — {product.price:,.0f} so'm\n\n"
-        f"🤖 Bot nomi: {bot_name}\n"
-        f"🔤 Username: {bot_username}\n\n"
-        f"Buyurtmani tasdiqlaysizmi?",
-        reply_markup=user_kb.confirm_order_kb(product.id),
-    )
-
-
 @router.callback_query(F.data.startswith("confirm_order:"))
 async def confirm_order(callback: CallbackQuery, session: AsyncSession, bot: Bot, state: FSMContext):
     product_id = int(callback.data.split(":")[1])
     product = await crud.get_product(session, product_id)
     user = await crud.get_user(session, callback.from_user.id)
-
-    data = await state.get_data()
-    bot_name = data.get("bot_name")
-    bot_username = data.get("bot_username")
-    await state.clear()
 
     if not product or not product.is_active:
         await callback.answer("Bu mahsulot endi mavjud emas.", show_alert=True)
@@ -314,27 +280,91 @@ async def confirm_order(callback: CallbackQuery, session: AsyncSession, bot: Bot
     await crud.adjust_balance(
         session, user.id, -product.price, "order_payment", description=f"Buyurtma: {product.name}"
     )
-    order = await crud.create_order(
-        session, user.id, product, custom_nickname=bot_name, custom_username=bot_username
-    )
+    order = await crud.create_order(session, user.id, product)
 
     await callback.message.edit_text(
-        f"✅ Buyurtmangiz qabul qilindi! #{order.id}\n\n"
+        f"✅ To'lov qabul qilindi! Buyurtma #{order.id}\n\n"
         f"🤖 {product.name}\n"
-        f"💵 {product.price:,.0f} so'm\n"
-        f"⏳ Bajarilish muddati: 24 soat ichida\n\n"
-        f"Admin tez orada siz bilan bog'lanadi."
+        f"💵 {product.price:,.0f} so'm"
     )
+
+    await state.update_data(pending_order_id=order.id)
+    await state.set_state(OrderFlow.waiting_api_key)
+    await callback.message.answer(
+        "🔑 Endi @BotFather orqali o'zingiz yaratgan botning <b>API key</b>ini (token) yuboring.\n\n"
+        "Masalan: <code>123456789:AAExampleTokenHere</code>\n\n"
+        "❗️ Bu tokenni faqat shu botga yuboring, boshqa hech kimga bermang."
+    )
+    await callback.answer()
+
+
+@router.message(OrderFlow.waiting_api_key)
+async def order_api_key_received(message: Message, state: FSMContext, session: AsyncSession):
+    api_key = (message.text or "").strip()
+    parts = api_key.split(":")
+    if len(parts) != 2 or not parts[0].isdigit() or len(parts[1]) < 10:
+        await message.answer(
+            "❗️ Bu API key formatiga o'xshamayapti. Iltimos, @BotFather bergan tokenni to'liq va aynan "
+            "nusxalab yuboring (masalan: 123456789:AAExampleTokenHere)."
+        )
+        return
+
+    data = await state.get_data()
+    order_id = data.get("pending_order_id")
+
+    order = await crud.get_order(session, order_id) if order_id else None
+    if not order:
+        await state.clear()
+        await message.answer("Xatolik yuz berdi, admin bilan bog'laning.", reply_markup=user_kb.main_menu_kb())
+        return
+
+    await crud.set_order_api_key(session, order.id, api_key)
+    await state.set_state(OrderFlow.waiting_admin_id)
+    await message.answer(
+        "🆔 Endi ushbu bot uchun <b>ADMIN Telegram ID</b> raqamini yuboring "
+        "(botni boshqaradigan shaxsning ID raqami — masalan @userinfobot orqali bilib olishingiz mumkin):"
+    )
+
+
+@router.message(OrderFlow.waiting_admin_id)
+async def order_admin_id_received(message: Message, state: FSMContext, session: AsyncSession, bot: Bot):
+    admin_id_text = (message.text or "").strip()
+    if not admin_id_text.isdigit():
+        await message.answer("❗️ Faqat raqam (Telegram ID) kiriting. Masalan: 123456789")
+        return
+
+    data = await state.get_data()
+    order_id = data.get("pending_order_id")
+    await state.clear()
+
+    order = await crud.get_order(session, order_id) if order_id else None
+    if not order:
+        await message.answer("Xatolik yuz berdi, admin bilan bog'laning.", reply_markup=user_kb.main_menu_kb())
+        return
+
+    await crud.set_order_admin_id(session, order.id, admin_id_text)
+    await message.answer(
+        "✅ Ma'lumotlar qabul qilindi! Admin tez orada botingizni sozlab, siz bilan bog'lanadi.",
+        reply_markup=user_kb.main_menu_kb(),
+    )
+
+    from bot.keyboards.admin_kb import order_status_kb
 
     admin_text = (
         f"🆕 <b>Yangi buyurtma #{order.id}</b>\n\n"
-        f"👤 Mijoz: {user.full_name} (@{user.username or '—'})\n"
-        f"🆔 ID: <code>{user.id}</code>\n"
-        f"🤖 Mahsulot: {product.name}\n"
-        f"💵 Narx: {product.price:,.0f} so'm\n\n"
-        f"🏷 Bot nomi: {bot_name}\n"
-        f"🔤 Bot username: {bot_username}"
+        f"👤 Mijoz: {message.from_user.full_name} (@{message.from_user.username or '—'})\n"
+        f"🆔 Mijoz ID: <code>{message.from_user.id}</code>\n"
+        f"🤖 Mahsulot: {order.product_name}\n"
+        f"💵 Narx: {order.price:,.0f} so'm\n"
+        + (f"💡 Hosting: {order.hosting_price:,.0f} so'm/oy\n" if order.hosting_price and order.hosting_price > 0 else "")
+        + f"\n🔑 API key: <code>{order.api_key}</code>"
+        + f"\n🆔 Bot admin ID: <code>{admin_id_text}</code>"
     )
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, admin_text, reply_markup=order_status_kb(order.id, order.status))
+        except Exception:
+            pass
     from bot.keyboards.admin_kb import order_status_kb
 
     for admin_id in ADMIN_IDS:
@@ -386,15 +416,14 @@ async def show_orders(message: Message, session: AsyncSession):
             f"━━━━━━━━━━━━━━━\n"
             f"🤖 Mahsulot: {o.product_name}\n"
             f"💵 Narx: {o.price:,.0f} so'm\n"
-        )
-        if o.custom_nickname:
-            text += f"🏷 Bot nomi: {o.custom_nickname}\n"
-        if o.custom_username:
-            text += f"🔤 Username: {o.custom_username}\n"
-        text += (
             f"📅 Sana: {o.created_at.strftime('%d.%m.%Y %H:%M')}\n"
             f"📌 Holat: {STATUS_LABELS.get(o.status, o.status)}"
         )
+        if o.status == "done" and o.hosting_price and o.hosting_price > 0:
+            if o.hosting_active and o.hosting_next_due:
+                text += f"\n🖥 Hosting muddati: {o.hosting_next_due.strftime('%d.%m.%Y')} gacha"
+            elif not o.hosting_active:
+                text += "\n🖥 Hosting: ⚠️ to'lov qilinmagani uchun uzilgan"
         await message.answer(text)
 
 

@@ -54,9 +54,12 @@ def product_detail_admin_kb(product: BotProduct) -> InlineKeyboardMarkup:
     )
     builder.row(
         InlineKeyboardButton(text="✏️ Narxi", callback_data=f"pedit:{product.id}:price"),
-        InlineKeyboardButton(text="✏️ Kategoriya", callback_data=f"pedit:{product.id}:category"),
+        InlineKeyboardButton(text="✏️ Hosting narxi", callback_data=f"pedit:{product.id}:hosting_price"),
     )
-    builder.row(InlineKeyboardButton(text="🖼 Rasm/Video", callback_data=f"pedit:{product.id}:media"))
+    builder.row(
+        InlineKeyboardButton(text="✏️ Kategoriya", callback_data=f"pedit:{product.id}:category"),
+        InlineKeyboardButton(text="🖼 Rasm/Video", callback_data=f"pedit:{product.id}:media"),
+    )
     toggle_label = "⏸ Sotuvdan olish" if product.is_active else "▶️ Sotuvga qaytarish"
     builder.row(InlineKeyboardButton(text=toggle_label, callback_data=f"ptoggle:{product.id}"))
     builder.row(InlineKeyboardButton(text="🗑 O'chirish", callback_data=f"pdelete:{product.id}"))
@@ -139,4 +142,15 @@ def user_manage_kb(user: User) -> InlineKeyboardMarkup:
     else:
         builder.row(InlineKeyboardButton(text="🚫 Bloklash", callback_data=f"uban:{user.id}"))
     builder.row(InlineKeyboardButton(text="🧾 Buyurtmalarini ko'rish", callback_data=f"uorders:{user.id}"))
+    builder.row(InlineKeyboardButton(text="✉️ Shaxsan xabar yuborish", callback_data=f"umsg:{user.id}"))
+    return builder.as_markup()
+
+
+def order_hosting_kb(order_id: int) -> InlineKeyboardMarkup:
+    """Foydalanuvchining bitta buyurtmasi uchun hosting boshqaruvi (to'landi / o'chirish)."""
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="✅ Hosting to'landi (+1 oy)", callback_data=f"hostpay:{order_id}"),
+        InlineKeyboardButton(text="🚫 Hostingni o'chirish", callback_data=f"hostoff:{order_id}"),
+    )
     return builder.as_markup()

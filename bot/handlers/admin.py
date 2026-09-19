@@ -82,10 +82,12 @@ async def list_orders(message: Message, session: AsyncSession):
             f"👤 Mijoz: {user.full_name if user else '—'} (@{user.username if user else '—'})\n"
             f"🆔 ID: <code>{o.user_id}</code>\n"
         )
-        if o.custom_nickname:
-            text += f"🏷 Bot nomi: {o.custom_nickname}\n"
-        if o.custom_username:
-            text += f"🔤 Username: {o.custom_username}\n"
+        if o.api_key:
+            text += f"🔑 API key: <code>{o.api_key}</code>\n"
+        if o.admin_telegram_id:
+            text += f"🆔 Bot admin ID: <code>{o.admin_telegram_id}</code>\n"
+        if o.hosting_price and o.hosting_price > 0:
+            text += f"🖥 Hosting: {o.hosting_price:,.0f} so'm/oy\n"
         text += (
             f"📅 {o.created_at.strftime('%d.%m.%Y %H:%M')}\n"
             f"📌 Holat: {o.status}"
@@ -112,6 +114,9 @@ async def change_order_status(callback: CallbackQuery, session: AsyncSession, bo
             session, order.user_id, order.price, "refund", description=f"Bekor qilingan buyurtma #{order.id}"
         )
 
+    if status == "done":
+        await crud.activate_hosting_on_done(session, order)
+
     if status == "in_progress":
         await callback.message.edit_reply_markup(reply_markup=admin_kb.order_status_kb(order.id, "in_progress"))
     else:
@@ -122,6 +127,13 @@ async def change_order_status(callback: CallbackQuery, session: AsyncSession, bo
         "done": "✅ Buyurtmangiz bajarildi! Xaridingiz uchun rahmat.",
         "cancelled": "❌ Buyurtmangiz bekor qilindi. Pulingiz balansingizga qaytarildi.",
     }.get(status, f"Buyurtma holati: {status}")
+
+    if status == "done" and order.hosting_price and order.hosting_price > 0 and order.hosting_next_due:
+        status_text += (
+            f"\n\n🖥 Birinchi oy hosting narxga kiritilgan. Keyingi to'lov sanasi: "
+            f"{order.hosting_next_due.strftime('%d.%m.%Y')}. Shu sanagacha hosting to'lovini amalga oshiring, "
+            f"aks holda botingiz hostingdan uziladi."
+        )
 
     try:
         await bot.send_message(order.user_id, f"#{order.id}\n{status_text}")
@@ -152,6 +164,7 @@ async def _show_product_admin(message_or_callback, session: AsyncSession, produc
         f"🤖 <b>{product.name}</b>\n\n"
         f"{product.description}\n\n"
         f"💵 Narxi: {product.price:,.0f} so'm\n"
+        f"🖥 Hosting: {product.hosting_price:,.0f} so'm/oy\n"
         f"🏷 Kategoriya: {product.category or '—'}\n"
         f"📌 Holati: {status}\n"
         f"🖼 Media: {'bor' if product.media_file_id else 'yo\u02bcq'}"
@@ -232,6 +245,7 @@ FIELD_PROMPTS = {
     "name": "✏️ Yangi nomni kiriting:",
     "description": "✏️ Yangi tavsifni kiriting:",
     "price": "✏️ Yangi narxni kiriting (faqat raqam):",
+    "hosting_price": "✏️ Yangi oylik hosting narxini kiriting (faqat raqam, hosting bo'lmasa 0 yozing):",
     "category": "✏️ Yangi kategoriyani kiriting (yoki \"-\"):",
     "media": "🖼 Yangi rasm yoki video (60 soniyagacha) yuboring:",
 }
@@ -257,7 +271,7 @@ async def product_edit_value_text(message: Message, state: FSMContext, session: 
         return
 
     value = message.text.strip()
-    if field == "price":
+    if field in ("price", "hosting_price"):
         if not value.replace(".", "", 1).isdigit():
             await message.answer("❗️ Faqat raqam kiriting.")
             return
@@ -329,6 +343,19 @@ async def add_product_price(message: Message, state: FSMContext):
         await message.answer("❗️ Iltimos, faqat raqam kiriting.")
         return
     await state.update_data(price=float(message.text))
+    await state.set_state(AdminAddProduct.hosting_price)
+    await message.answer(
+        "🖥 Oylik hosting narxini kiriting (faqat raqam, so'mda).\n"
+        "Agar hosting kerak bo'lmasa, 0 deb yozing:"
+    )
+
+
+@router.message(AdminAddProduct.hosting_price)
+async def add_product_hosting_price(message: Message, state: FSMContext):
+    if not message.text.replace(".", "", 1).isdigit():
+        await message.answer("❗️ Iltimos, faqat raqam kiriting (hosting kerak bo'lmasa 0).")
+        return
+    await state.update_data(hosting_price=float(message.text))
     await state.set_state(AdminAddProduct.category)
     await message.answer("🏷 Kategoriyasini kiriting (yoki \"-\" deb yozing):")
 
@@ -370,13 +397,15 @@ async def _finish_add_product(message: Message, state: FSMContext, session: Asyn
         name=data["name"],
         description=data["description"],
         price=data["price"],
+        hosting_price=data.get("hosting_price", 0),
         category=data.get("category"),
         media_file_id=media_file_id,
         media_type=media_type,
     )
     await state.clear()
+    hosting_line = f"\n🖥 Hosting: {product.hosting_price:,.0f} so'm/oy" if product.hosting_price else ""
     await message.answer(
-        f"✅ Mahsulot qo'shildi!\n\n#{product.id} — {product.name} — {product.price:,.0f} so'm",
+        f"✅ Mahsulot qo'shildi!\n\n#{product.id} — {product.name} — {product.price:,.0f} so'm{hosting_line}",
         reply_markup=admin_kb.admin_menu_kb(),
     )
 
@@ -695,6 +724,15 @@ async def _show_user_admin_card(message: Message, session: AsyncSession, user_id
         f"🚦 Holat: {'🚫 Bloklangan' if user.is_blocked else '✅ Faol'}\n"
         f"📅 Ro'yxatdan o'tgan: {user.created_at.strftime('%d.%m.%Y')}"
     )
+
+    hosted = await crud.get_user_hosted_orders(session, user_id)
+    if hosted:
+        text += "\n\n🖥 <b>Hosting qilingan botlari:</b>"
+        for o in hosted:
+            due = o.hosting_next_due.strftime("%d.%m.%Y") if o.hosting_next_due else "—"
+            state_icon = "🟢" if o.hosting_active else "🔴 uzilgan"
+            text += f"\n#{o.id} {o.product_name} — {state_icon} — muddat: {due}"
+
     await message.answer(text, reply_markup=admin_kb.user_manage_kb(user))
 
 
@@ -771,6 +809,95 @@ async def user_orders_view(callback: CallbackQuery, session: AsyncSession):
         await callback.message.answer("Bu foydalanuvchida buyurtmalar yo'q.")
         await callback.answer()
         return
+    for o in orders:
+        text = f"#{o.id} — {o.product_name} — {o.price:,.0f} so'm — {o.status}"
+        if o.api_key:
+            text += f"\n🔑 <code>{o.api_key}</code>"
+        if o.admin_telegram_id:
+            text += f"\n🆔 Admin ID: <code>{o.admin_telegram_id}</code>"
+        if o.status == "done" and o.hosting_price and o.hosting_price > 0:
+            due = o.hosting_next_due.strftime("%d.%m.%Y") if o.hosting_next_due else "—"
+            active = "🟢 faol" if o.hosting_active else "🔴 uzilgan"
+            text += f"\n🖥 Hosting: {o.hosting_price:,.0f} so'm/oy — {active} — muddat: {due}"
+            await callback.message.answer(text, reply_markup=admin_kb.order_hosting_kb(o.id))
+        else:
+            await callback.message.answer(text)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("hostpay:"))
+async def hosting_mark_paid(callback: CallbackQuery, session: AsyncSession, bot: Bot):
+    if not await require_admin(callback.from_user.id, session):
+        await callback.answer()
+        return
+    order_id = int(callback.data.split(":")[1])
+    order = await crud.renew_hosting(session, order_id)
+    if not order:
+        await callback.answer("Buyurtma topilmadi.", show_alert=True)
+        return
+    await callback.answer("Hosting +1 oyga uzaytirildi")
+    await callback.message.answer(
+        f"✅ #{order.id} buyurtmasi uchun hosting yangilandi. Keyingi muddat: "
+        f"{order.hosting_next_due.strftime('%d.%m.%Y')}"
+    )
+    try:
+        await bot.send_message(
+            order.user_id,
+            f"✅ #{order.id} botingiz uchun hosting to'lovi qabul qilindi. "
+            f"Keyingi to'lov sanasi: {order.hosting_next_due.strftime('%d.%m.%Y')}",
+        )
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data.startswith("hostoff:"))
+async def hosting_disable(callback: CallbackQuery, session: AsyncSession, bot: Bot):
+    if not await require_admin(callback.from_user.id, session):
+        await callback.answer()
+        return
+    order_id = int(callback.data.split(":")[1])
+    order = await crud.disable_hosting(session, order_id)
+    if not order:
+        await callback.answer("Buyurtma topilmadi.", show_alert=True)
+        return
+    await callback.answer("Hosting o'chirildi")
+    await callback.message.answer(f"🚫 #{order.id} buyurtmasi uchun hosting o'chirildi.")
+    try:
+        await bot.send_message(
+            order.user_id, f"⚠️ #{order.id} botingizning hostingi admin tomonidan o'chirildi."
+        )
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data.startswith("umsg:"))
+async def user_message_start(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
+    if not await require_admin(callback.from_user.id, session):
+        await callback.answer()
+        return
+    user_id = int(callback.data.split(":")[1])
+    await state.update_data(target_user_id=user_id)
+    await state.set_state(AdminManageUsers.message_text)
+    await callback.message.answer(
+        f"✉️ {user_id} foydalanuvchisiga yuboriladigan xabarni yozing:", reply_markup=admin_kb.cancel_kb()
+    )
+    await callback.answer()
+
+
+@router.message(AdminManageUsers.message_text)
+async def user_message_finish(message: Message, state: FSMContext, session: AsyncSession, bot: Bot):
+    data = await state.get_data()
+    user_id = data.get("target_user_id")
+    await state.clear()
+
+    try:
+        await bot.send_message(user_id, message.html_text or message.text)
+        await message.answer("✅ Xabar yuborildi.", reply_markup=admin_kb.admin_menu_kb())
+    except Exception:
+        await message.answer(
+            "❗️ Xabar yuborilmadi (foydalanuvchi botni bloklagan bo'lishi mumkin).",
+            reply_markup=admin_kb.admin_menu_kb(),
+        )
     lines = [f"🧾 <b>{user_id} foydalanuvchining buyurtmalari:</b>\n"]
     for o in orders:
         lines.append(f"#{o.id} — {o.product_name} — {o.price:,.0f} so'm — {o.status}")

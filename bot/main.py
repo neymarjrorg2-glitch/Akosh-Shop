@@ -12,6 +12,7 @@ from bot.database.engine import init_db
 from bot.middlewares import DatabaseMiddleware
 from bot.handlers import user as user_handlers
 from bot.handlers import admin as admin_handlers
+from bot.utils.hosting import hosting_reminder_loop
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -44,6 +45,7 @@ async def main() -> None:
 
     logger.info("Bot ishga tushdi.")
     await bot.delete_webhook(drop_pending_updates=True)
+    asyncio.create_task(hosting_reminder_loop(bot))
     await dp.start_polling(bot, handle_signals=True)
 
 
