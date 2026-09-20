@@ -9,6 +9,17 @@ from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 from bot.database.models import BotProduct, MandatorySubscription
 
 
+# Asosiy menyu tugmalari matni (FSM holatida ham menyu tugmalari ishlashi uchun filtrlarda ishlatiladi)
+MAIN_MENU_TEXTS = {
+    "🤖 Botlar katalogi",
+    "👤 Hisobim",
+    "💳 Balans to'ldirish",
+    "🧾 Buyurtmalarim",
+    "👥 Referral",
+    "🆘 Yordam",
+}
+
+
 def main_menu_kb() -> ReplyKeyboardMarkup:
     builder = ReplyKeyboardBuilder()
     builder.row(KeyboardButton(text="🤖 Botlar katalogi"), KeyboardButton(text="👤 Hisobim"))

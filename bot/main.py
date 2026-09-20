@@ -45,8 +45,13 @@ async def main() -> None:
 
     logger.info("Bot ishga tushdi.")
     await bot.delete_webhook(drop_pending_updates=True)
-    asyncio.create_task(hosting_reminder_loop(bot))
-    await dp.start_polling(bot, handle_signals=True)
+
+    # Task'ga havola saqlab qo'yamiz, aks holda Python uni "axlat" deb o'chirib yuborishi mumkin
+    hosting_task = asyncio.create_task(hosting_reminder_loop(bot))
+    try:
+        await dp.start_polling(bot, handle_signals=True)
+    finally:
+        hosting_task.cancel()
 
 
 if __name__ == "__main__":

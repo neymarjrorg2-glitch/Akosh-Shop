@@ -4,7 +4,6 @@ from datetime import datetime
 
 from aiogram import Bot
 
-from bot.config import ADMIN_IDS
 from bot.database import crud
 from bot.database.engine import async_session
 
@@ -48,7 +47,7 @@ async def _check_once(bot: Bot) -> None:
             except Exception as e:
                 logger.warning("Hosting uzilishi haqida xabar yuborilmadi (user_id=%s): %s", order.user_id, e)
 
-            for admin_id in ADMIN_IDS:
+            for admin_id in await crud.get_all_admin_ids(session):
                 try:
                     await bot.send_message(
                         admin_id,

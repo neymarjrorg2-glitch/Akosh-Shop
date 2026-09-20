@@ -27,7 +27,10 @@ bot/
   utils/
     states.py               — FSM holatlari
     subscription_check.py    — majburiy obunani tekshirish logikasi
+    adsgram.py               — AdsGram reklamalarini yuborish
 ```
+
+> O'zgarishlar ro'yxati: [CHANGELOG.md](CHANGELOG.md)
 
 ## 1. Lokal ishga tushirish (sinov uchun)
 
@@ -52,6 +55,10 @@ python -m bot.main
    - `BOT_TOKEN` — BotFather'dan olingan token
    - `ADMIN_IDS` — sizning Telegram ID raqamingiz (@userinfobot orqali bilib oling), bir nechta bo'lsa vergul bilan: `123456,987654`
    - `DEFAULT_REFERRAL_PERCENT` — ixtiyoriy, standart 5
+   - `ADSGRAM_TOKEN` — AdsGram kabinetidagi token (bo'sh bo'lsa, reklama o'chiq)
+   - `ADSGRAM_BLOCK_ID` — AdsGram blok ID ning faqat raqami (`bot-` prefiksisiz)
+   - `ADSGRAM_LANGUAGE` — ixtiyoriy, reklama tili
+   - `ADSGRAM_COOLDOWN_SECONDS` — ixtiyoriy, reklamalar orasidagi vaqt (standart 300 soniya)
 5. Railway `Procfile`ni avtomatik aniqlaydi (`worker: python -m bot.main`) va botni ishga tushiradi.
 6. Loglarni "Deployments" bo'limidan kuzatishingiz mumkin — "Bot ishga tushdi." yozuvi chiqsa, hammasi tayyor.
 

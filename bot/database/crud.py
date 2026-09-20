@@ -2,7 +2,7 @@ import calendar
 from datetime import datetime, timedelta
 from typing import Optional, Sequence
 
-from sqlalchemy import select, func
+from sqlalchemy import select, func, update, delete
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -55,12 +55,21 @@ async def get_or_create_user(
         is_admin=is_admin,
     )
     session.add(user)
-    await session.commit()
+    try:
+        await session.commit()
+    except IntegrityError:
+        # Ikki so'rov bir vaqtda kelib, foydalanuvchi allaqachon yaratilgan bo'lsa
+        await session.rollback()
+        existing = await session.get(User, user_id)
+        if existing:
+            return existing, False
+        raise
     return user, True
 
 
 async def get_user(session: AsyncSession, user_id: int) -> Optional[User]:
-    return await session.get(User, user_id)
+    # populate_existing: session ichida oldindan yuklangan (eskirgan) nusxa emas, bazadagi joriy qiymat olinadi
+    return await session.get(User, user_id, populate_existing=True)
 
 
 async def set_phone(session: AsyncSession, user_id: int, phone: str) -> None:
@@ -78,6 +87,27 @@ async def set_user_blocked(session: AsyncSession, user_id: int, blocked: bool) -
     return user
 
 
+async def _apply_balance_change(
+    session: AsyncSession,
+    user_id: int,
+    amount: float,
+    tx_type: str,
+    description: Optional[str] = None,
+) -> bool:
+    """Balansni SQL darajasida atomik o'zgartiradi va tranzaksiya yozuvini qo'shadi.
+    COMMIT QILMAYDI - chaqiruvchi o'zi commit qiladi (shunda bir nechta amal bitta tranzaksiyada bo'ladi)."""
+    values = {"balance": User.balance + amount}
+    if tx_type == "topup":
+        values["total_topped_up"] = User.total_topped_up + amount
+    result = await session.execute(
+        update(User).where(User.id == user_id).values(**values).execution_options(synchronize_session=False)
+    )
+    if result.rowcount != 1:
+        return False
+    session.add(Transaction(user_id=user_id, amount=amount, type=tx_type, description=description))
+    return True
+
+
 async def adjust_balance(
     session: AsyncSession,
     user_id: int,
@@ -85,14 +115,33 @@ async def adjust_balance(
     tx_type: str,
     description: Optional[str] = None,
 ) -> None:
-    user = await session.get(User, user_id)
-    if not user:
+    ok = await _apply_balance_change(session, user_id, amount, tx_type, description)
+    if not ok:
         return
-    user.balance += amount
-    if tx_type == "topup":
-        user.total_topped_up += amount
-    session.add(Transaction(user_id=user_id, amount=amount, type=tx_type, description=description))
     await session.commit()
+
+
+async def charge_balance(
+    session: AsyncSession,
+    user_id: int,
+    amount: float,
+    tx_type: str,
+    description: Optional[str] = None,
+) -> bool:
+    """Balansdan pulni ATOMIK yechadi: faqat balans yetarli bo'lsagina (bitta SQL so'rovda).
+    Shu tufayli tugmani ketma-ket ikki marta bosish balansni minusga tushirib yubormaydi.
+    Qaytaradi: True - yechildi, False - balans yetarli emas (yoki foydalanuvchi yo'q)."""
+    result = await session.execute(
+        update(User)
+        .where(User.id == user_id, User.balance >= amount)
+        .values(balance=User.balance - amount)
+        .execution_options(synchronize_session=False)
+    )
+    if result.rowcount != 1:
+        return False  # hech narsa o'zgarmadi, rollback shart emas
+    session.add(Transaction(user_id=user_id, amount=-amount, type=tx_type, description=description))
+    await session.commit()
+    return True
 
 
 async def get_referral_percent(session: AsyncSession) -> float:
@@ -137,8 +186,8 @@ async def apply_referral_bonus_if_first_topup(session: AsyncSession, user: User,
     if not user.referred_by or not user.referral_qualified:
         return
 
-    is_first_topup = user.total_topped_up == topup_amount  # to'lovdan oldin 0 bo'lgan bo'lsa
-
+    # to'lov allaqachon qo'shilgan bo'lgani uchun, birinchi to'ldirishda jami == shu miqdor bo'ladi
+    is_first_topup = abs(user.total_topped_up - topup_amount) < 0.005
     if not is_first_topup:
         return
 
@@ -151,8 +200,12 @@ async def apply_referral_bonus_if_first_topup(session: AsyncSession, user: User,
     if bonus <= 0:
         return
 
-    inviter.balance += bonus
-    inviter.referral_earned += bonus
+    await session.execute(
+        update(User)
+        .where(User.id == inviter.id)
+        .values(balance=User.balance + bonus, referral_earned=User.referral_earned + bonus)
+        .execution_options(synchronize_session=False)
+    )
     session.add(
         Transaction(
             user_id=inviter.id,
@@ -422,6 +475,82 @@ async def get_active_orders(session: AsyncSession) -> Sequence[Order]:
     return result.scalars().all()
 
 
+_ORDER_TRANSITIONS = {
+    "in_progress": ("pending",),
+    "done": ("pending", "in_progress"),
+    "cancelled": ("pending", "in_progress"),
+}
+
+
+async def transition_order_status(session: AsyncSession, order_id: int, new_status: str) -> Optional[Order]:
+    """Buyurtma holatini ATOMIK o'zgartiradi. Faqat yakunlanmagan (pending/in_progress) buyurtmalar
+    o'zgaradi - shu tufayli "Bekor qilish" tugmasini ikki marta bosish (yoki ikki admin bosishi)
+    pulni ikki marta qaytarib yubormaydi.
+    - cancelled: pul foydalanuvchi balansiga qaytariladi (bir tranzaksiyada)
+    - done: hosting bo'lsa, keyingi to'lov sanasi belgilanadi
+    Qaytaradi: yangilangan buyurtma yoki None (topilmadi / holati allaqachon o'zgargan)."""
+    allowed_from = _ORDER_TRANSITIONS.get(new_status)
+    if not allowed_from:
+        return None
+
+    order = await session.get(Order, order_id, populate_existing=True)
+    if not order:
+        return None
+
+    values = {"status": new_status}
+    if new_status == "done" and order.hosting_price and order.hosting_price > 0:
+        values.update(
+            hosting_next_due=add_months(datetime.utcnow(), 1),
+            hosting_active=True,
+            hosting_reminder_sent=False,
+        )
+
+    result = await session.execute(
+        update(Order)
+        .where(Order.id == order_id, Order.status.in_(allowed_from))
+        .values(**values)
+        .execution_options(synchronize_session=False)
+    )
+    if result.rowcount != 1:
+        return None  # holat allaqachon o'zgargan; hech narsa o'zgarmadi
+
+    if new_status == "cancelled":
+        await _apply_balance_change(
+            session, order.user_id, order.price, "refund", description=f"Bekor qilingan buyurtma #{order.id}"
+        )
+
+    await session.commit()
+    await session.refresh(order)
+    return order
+
+
+async def get_order_awaiting_api_key(session: AsyncSession, user_id: int) -> Optional[Order]:
+    """To'lov qilingan, lekin API key hali kiritilmagan oxirgi buyurtma (bot qayta ishga tushgandan keyin davom ettirish uchun)."""
+    result = await session.execute(
+        select(Order)
+        .where(Order.user_id == user_id, Order.status == "pending", Order.api_key.is_(None))
+        .order_by(Order.id.desc())
+        .limit(1)
+    )
+    return result.scalars().first()
+
+
+async def get_order_awaiting_admin_id(session: AsyncSession, user_id: int) -> Optional[Order]:
+    """API key kiritilgan, lekin bot admin ID'si hali kiritilmagan oxirgi buyurtma."""
+    result = await session.execute(
+        select(Order)
+        .where(
+            Order.user_id == user_id,
+            Order.status == "pending",
+            Order.api_key.isnot(None),
+            Order.admin_telegram_id.is_(None),
+        )
+        .order_by(Order.id.desc())
+        .limit(1)
+    )
+    return result.scalars().first()
+
+
 async def update_order_status(
     session: AsyncSession, order_id: int, status: str, admin_note: Optional[str] = None
 ) -> Optional[Order]:
@@ -458,23 +587,42 @@ async def get_pending_topup_requests(session: AsyncSession) -> Sequence[TopupReq
 
 async def process_topup_request(
     session: AsyncSession, request_id: int, approve: bool, admin_id: int
-) -> Optional[TopupRequest]:
-    req = await session.get(TopupRequest, request_id)
-    if not req or req.status != "pending":
-        return req
+) -> tuple[Optional[TopupRequest], bool]:
+    """To'lov so'rovini tasdiqlaydi yoki rad etadi - faqat BIR MARTA.
+    Ikki admin (yoki ikki marta bosish) bir vaqtda tasdiqlasa ham, balans faqat bir marta to'ldiriladi.
+    Qaytaradi: (so'rov, shu chaqiruv holatni o'zgartirdimi). Agar allaqachon ko'rib chiqilgan bo'lsa - (so'rov, False)."""
+    req = await session.get(TopupRequest, request_id, populate_existing=True)
+    if not req:
+        return None, False
 
-    req.status = "approved" if approve else "rejected"
-    req.processed_at = datetime.utcnow()
-    req.processed_by = admin_id
-    await session.commit()
+    result = await session.execute(
+        update(TopupRequest)
+        .where(TopupRequest.id == request_id, TopupRequest.status == "pending")
+        .values(
+            status="approved" if approve else "rejected",
+            processed_at=datetime.utcnow(),
+            processed_by=admin_id,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if result.rowcount != 1:
+        req = await session.get(TopupRequest, request_id, populate_existing=True)
+        return req, False
 
     if approve:
-        await adjust_balance(session, req.user_id, req.amount, "topup", description=f"To'lov so'rovi #{req.id}")
-        user = await get_user(session, req.user_id)
+        # holat o'zgarishi va balans to'ldirilishi BITTA tranzaksiyada commit qilinadi
+        await _apply_balance_change(
+            session, req.user_id, req.amount, "topup", description=f"To'lov so'rovi #{req.id}"
+        )
+    await session.commit()
+    await session.refresh(req)
+
+    if approve:
+        user = await session.get(User, req.user_id, populate_existing=True)
         if user:
             await apply_referral_bonus_if_first_topup(session, user, req.amount)
 
-    return req
+    return req, True
 
 
 # ---------- MAJBURIY OBUNALAR ----------
@@ -500,31 +648,43 @@ async def add_subscription(
 async def remove_subscription(session: AsyncSession, sub_id: int) -> None:
     sub = await session.get(MandatorySubscription, sub_id)
     if sub:
+        # avval foydalanuvchilarning tasdiqlash yozuvlari o'chiriladi (aks holda FK xatosi chiqadi)
+        await session.execute(
+            delete(UserSubscriptionConfirmation).where(UserSubscriptionConfirmation.subscription_id == sub_id)
+        )
         await session.delete(sub)
         await session.commit()
 
 
 async def confirm_subscription(session: AsyncSession, user_id: int, sub_id: int) -> None:
+    sub = await session.get(MandatorySubscription, sub_id)
+    if not sub:
+        return  # obuna o'chirib yuborilgan bo'lsa, FK xatosi chiqmasligi uchun
     existing = await session.execute(
-        select(UserSubscriptionConfirmation).where(
+        select(UserSubscriptionConfirmation.id)
+        .where(
             UserSubscriptionConfirmation.user_id == user_id,
             UserSubscriptionConfirmation.subscription_id == sub_id,
         )
+        .limit(1)
     )
-    if existing.scalar_one_or_none():
+    if existing.first():
         return
     session.add(UserSubscriptionConfirmation(user_id=user_id, subscription_id=sub_id))
     await session.commit()
 
 
 async def is_subscription_confirmed(session: AsyncSession, user_id: int, sub_id: int) -> bool:
+    # .first() ishlatiladi: tugma ketma-ket ikki marta bosilib dublikat yozuv paydo bo'lsa ham xato bermaydi
     result = await session.execute(
-        select(UserSubscriptionConfirmation).where(
+        select(UserSubscriptionConfirmation.id)
+        .where(
             UserSubscriptionConfirmation.user_id == user_id,
             UserSubscriptionConfirmation.subscription_id == sub_id,
         )
+        .limit(1)
     )
-    return result.scalar_one_or_none() is not None
+    return result.first() is not None
 
 
 # ---------- ADMINLAR ----------
@@ -555,6 +715,12 @@ async def remove_admin(session: AsyncSession, user_id: int) -> bool:
         await session.commit()
         return True
     return False
+
+
+async def get_all_admin_ids(session: AsyncSession) -> set[int]:
+    """Barcha adminlar: .env dagi asosiy adminlar + bazadan qo'shilganlar (xabarnomalar uchun)."""
+    db_admins = await get_db_admins(session)
+    return set(ADMIN_IDS) | {u.id for u in db_admins}
 
 
 async def get_db_admins(session: AsyncSession) -> Sequence[User]:

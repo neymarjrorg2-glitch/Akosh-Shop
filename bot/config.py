@@ -26,3 +26,11 @@ DEFAULT_REFERRAL_PERCENT = float(os.getenv("DEFAULT_REFERRAL_PERCENT", "5"))
 
 # Buyurtma bajarilishi uchun standart muddat (soatda)
 ORDER_DEADLINE_HOURS = 24
+
+# AdsGram reklama sozlamalari (token bo'sh bo'lsa, reklama o'chiq turadi)
+ADSGRAM_TOKEN = os.getenv("ADSGRAM_TOKEN", "").strip()
+# Blok ID ning faqat raqamli qismi ("bot-" prefiksisiz)
+ADSGRAM_BLOCK_ID = os.getenv("ADSGRAM_BLOCK_ID", "").replace("bot-", "").strip()
+ADSGRAM_LANGUAGE = os.getenv("ADSGRAM_LANGUAGE", "").strip()
+# Bitta foydalanuvchiga ketma-ket ikki reklama orasidagi minimal vaqt (soniya)
+ADSGRAM_COOLDOWN_SECONDS = int(os.getenv("ADSGRAM_COOLDOWN_SECONDS", "300"))

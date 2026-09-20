@@ -1,9 +1,12 @@
-from aiogram import Router, F, Bot
-from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from aiogram.types import Message, CallbackQuery
-from sqlalchemy.ext.asyncio import AsyncSession
 import asyncio
+import html
+import logging
+
+from aiogram import Router, F, Bot
+from aiogram.filters import Command, BaseFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.types import Message, CallbackQuery, TelegramObject
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import ADMIN_IDS
 from bot.database import crud
@@ -21,10 +24,32 @@ from bot.utils.states import (
 )
 
 router = Router(name="admin")
+logger = logging.getLogger(__name__)
 
 
 async def require_admin(event_user_id: int, session: AsyncSession) -> bool:
     return await crud.is_user_admin(session, event_user_id)
+
+
+class IsAdmin(BaseFilter):
+    """Xabar yuboruvchi admin bo'lsagina o'tkazadi (env yoki bazadagi admin)."""
+
+    async def __call__(self, event: TelegramObject, session: AsyncSession) -> bool:
+        user = getattr(event, "from_user", None)
+        return bool(user) and await crud.is_user_admin(session, user.id)
+
+
+async def _append_note(message: Message, note: str) -> None:
+    """Xabar (matn yoki rasm izohi) oxiriga izoh qo'shadi va tugmalarni olib tashlaydi.
+    html_text ishlatiladi, shunda maxsus belgilar (<, &) HTML xatosini keltirib chiqarmaydi."""
+    base = message.html_text or ""
+    try:
+        if message.photo:
+            await message.edit_caption(caption=base + note)
+        else:
+            await message.edit_text(base + note)
+    except Exception as e:
+        logger.debug("Xabarni tahrirlab bo'lmadi: %s", e)
 
 
 @router.message(Command("admin"))
@@ -32,6 +57,15 @@ async def cmd_admin(message: Message, session: AsyncSession):
     if not await require_admin(message.from_user.id, session):
         return
     await message.answer("🔧 <b>Admin panel</b>", reply_markup=admin_kb.admin_menu_kb())
+
+
+# Admin router foydalanuvchi routeridan OLDIN ulangani uchun, FSM holatlaridagi handlerlar
+# "❌ Bekor qilish" matnini oddiy kiritilgan qiymat deb qabul qilib yuborardi.
+# Shu sababli bekor qilish shu yerda, boshqa handlerlardan oldin ushlanadi.
+@router.message(F.text == "❌ Bekor qilish", IsAdmin())
+async def admin_cancel(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Bekor qilindi.", reply_markup=admin_kb.admin_menu_kb())
 
 
 @router.message(F.text == "⬅️ Oddiy menyu")
@@ -79,7 +113,7 @@ async def list_orders(message: Message, session: AsyncSession):
             f"🧾 <b>Buyurtma #{o.id}</b>\n"
             f"━━━━━━━━━━━━━━━\n"
             f"🤖 {o.product_name} — {o.price:,.0f} so'm\n"
-            f"👤 Mijoz: {user.full_name if user else '—'} (@{user.username if user else '—'})\n"
+            f"👤 Mijoz: {html.escape(user.full_name or '—') if user else '—'} (@{user.username if user else '—'})\n"
             f"🆔 ID: <code>{o.user_id}</code>\n"
         )
         if o.api_key:
@@ -101,26 +135,35 @@ async def change_order_status(callback: CallbackQuery, session: AsyncSession, bo
         await callback.answer()
         return
 
-    _, order_id_str, status = callback.data.split(":")
-    order_id = int(order_id_str)
+    try:
+        _, order_id_str, status = callback.data.split(":")
+        order_id = int(order_id_str)
+    except ValueError:
+        await callback.answer()
+        return
 
-    order = await crud.update_order_status(session, order_id, status)
-    if not order:
+    if not await crud.get_order(session, order_id):
         await callback.answer("Buyurtma topilmadi.", show_alert=True)
         return
 
-    if status == "cancelled":
-        await crud.adjust_balance(
-            session, order.user_id, order.price, "refund", description=f"Bekor qilingan buyurtma #{order.id}"
-        )
-
-    if status == "done":
-        await crud.activate_hosting_on_done(session, order)
+    # Holat ATOMIK o'zgaradi: faqat yakunlanmagan buyurtma o'zgaradi va bekor qilinganda
+    # pul faqat BIR MARTA qaytariladi (tugmani qayta bosish yoki boshqa admin bosishidan himoya).
+    order = await crud.transition_order_status(session, order_id, status)
+    if not order:
+        await callback.answer("Bu buyurtmaning holati allaqachon o'zgargan.", show_alert=True)
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
 
     if status == "in_progress":
-        await callback.message.edit_reply_markup(reply_markup=admin_kb.order_status_kb(order.id, "in_progress"))
+        try:
+            await callback.message.edit_reply_markup(reply_markup=admin_kb.order_status_kb(order.id, "in_progress"))
+        except Exception:
+            pass
     else:
-        await callback.message.edit_text(callback.message.text + f"\n\n➡️ Yangi holat: {status}")
+        await _append_note(callback.message, f"\n\n➡️ Yangi holat: {status}")
 
     status_text = {
         "in_progress": "🔄 Buyurtmangiz jarayonga qabul qilindi.",
@@ -137,8 +180,8 @@ async def change_order_status(callback: CallbackQuery, session: AsyncSession, bo
 
     try:
         await bot.send_message(order.user_id, f"#{order.id}\n{status_text}")
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("Buyurtma holati haqida mijozga xabar yuborilmadi (user_id=%s): %s", order.user_id, e)
     await callback.answer("Yangilandi")
 
 
@@ -160,6 +203,7 @@ async def _show_product_admin(message_or_callback, session: AsyncSession, produc
     if not product:
         return
     status = "🟢 Faol" if product.is_active else "⚪️ Nofaol"
+    media_text = "bor" if product.media_file_id else "yo\u02bcq"
     text = (
         f"🤖 <b>{product.name}</b>\n\n"
         f"{product.description}\n\n"
@@ -167,7 +211,7 @@ async def _show_product_admin(message_or_callback, session: AsyncSession, produc
         f"🖥 Hosting: {product.hosting_price:,.0f} so'm/oy\n"
         f"🏷 Kategoriya: {product.category or '—'}\n"
         f"📌 Holati: {status}\n"
-        f"🖼 Media: {'bor' if product.media_file_id else 'yo\u02bcq'}"
+        f"🖼 Media: {media_text}"
     )
     kb = admin_kb.product_detail_admin_kb(product)
     if hasattr(message_or_callback, "edit_text") and edit:
@@ -191,6 +235,9 @@ async def product_admin_detail(callback: CallbackQuery, session: AsyncSession):
 
 @router.callback_query(F.data == "padmin_back")
 async def product_admin_back(callback: CallbackQuery, session: AsyncSession):
+    if not await require_admin(callback.from_user.id, session):
+        await callback.answer()
+        return
     products = await crud.get_all_products(session)
     await callback.message.answer(
         "🤖 <b>Mahsulotlar</b> (🟢 faol / ⚪️ nofaol):" if products else "Hozircha mahsulot yo'q.",
@@ -252,8 +299,14 @@ FIELD_PROMPTS = {
 
 
 @router.callback_query(F.data.startswith("pedit:"))
-async def product_edit_start(callback: CallbackQuery, state: FSMContext):
+async def product_edit_start(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
+    if not await require_admin(callback.from_user.id, session):
+        await callback.answer()
+        return
     _, product_id_str, field = callback.data.split(":")
+    if field not in FIELD_PROMPTS:
+        await callback.answer()
+        return
     await state.update_data(product_id=int(product_id_str), field=field)
     await state.set_state(AdminEditProduct.waiting_value)
     await callback.message.answer(FIELD_PROMPTS[field], reply_markup=admin_kb.cancel_kb())
@@ -270,7 +323,7 @@ async def product_edit_value_text(message: Message, state: FSMContext, session: 
         await message.answer("🖼 Iltimos, RASM yoki VIDEO yuboring (matn emas).")
         return
 
-    value = message.text.strip()
+    value = (message.text or "").strip()
     if field in ("price", "hosting_price"):
         if not value.replace(".", "", 1).isdigit():
             await message.answer("❗️ Faqat raqam kiriting.")
@@ -317,7 +370,10 @@ async def product_edit_value_video(message: Message, state: FSMContext, session:
 
 
 @router.callback_query(F.data == "padmin_add")
-async def add_product_start(callback: CallbackQuery, state: FSMContext):
+async def add_product_start(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
+    if not await require_admin(callback.from_user.id, session):
+        await callback.answer()
+        return
     await state.set_state(AdminAddProduct.name)
     await callback.message.answer("🤖 Yangi mahsulot nomini kiriting:", reply_markup=admin_kb.cancel_kb())
     await callback.answer()
@@ -325,6 +381,9 @@ async def add_product_start(callback: CallbackQuery, state: FSMContext):
 
 @router.message(AdminAddProduct.name)
 async def add_product_name(message: Message, state: FSMContext):
+    if not message.text:
+        await message.answer("❗️ Iltimos, matn yuboring.")
+        return
     await state.update_data(name=message.text)
     await state.set_state(AdminAddProduct.description)
     await message.answer("📝 Tavsifini kiriting:")
@@ -332,6 +391,9 @@ async def add_product_name(message: Message, state: FSMContext):
 
 @router.message(AdminAddProduct.description)
 async def add_product_description(message: Message, state: FSMContext):
+    if not message.text:
+        await message.answer("❗️ Iltimos, matn yuboring.")
+        return
     await state.update_data(description=message.text)
     await state.set_state(AdminAddProduct.price)
     await message.answer("💵 Narxini kiriting (faqat raqam, so'mda):")
@@ -339,7 +401,7 @@ async def add_product_description(message: Message, state: FSMContext):
 
 @router.message(AdminAddProduct.price)
 async def add_product_price(message: Message, state: FSMContext):
-    if not message.text.replace(".", "", 1).isdigit():
+    if not (message.text or "").replace(".", "", 1).isdigit():
         await message.answer("❗️ Iltimos, faqat raqam kiriting.")
         return
     await state.update_data(price=float(message.text))
@@ -352,7 +414,7 @@ async def add_product_price(message: Message, state: FSMContext):
 
 @router.message(AdminAddProduct.hosting_price)
 async def add_product_hosting_price(message: Message, state: FSMContext):
-    if not message.text.replace(".", "", 1).isdigit():
+    if not (message.text or "").replace(".", "", 1).isdigit():
         await message.answer("❗️ Iltimos, faqat raqam kiriting (hosting kerak bo'lmasa 0).")
         return
     await state.update_data(hosting_price=float(message.text))
@@ -362,7 +424,7 @@ async def add_product_hosting_price(message: Message, state: FSMContext):
 
 @router.message(AdminAddProduct.category)
 async def add_product_category(message: Message, state: FSMContext):
-    category = None if message.text.strip() == "-" else message.text.strip()
+    category = None if (message.text or "").strip() == "-" else (message.text or "").strip()
     await state.update_data(category=category)
     await state.set_state(AdminAddProduct.media)
     await message.answer(
@@ -445,7 +507,10 @@ async def add_sub_start(callback: CallbackQuery, session: AsyncSession):
 
 
 @router.callback_query(F.data.startswith("sub_platform:"))
-async def add_sub_platform(callback: CallbackQuery, state: FSMContext):
+async def add_sub_platform(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
+    if not await require_admin(callback.from_user.id, session):
+        await callback.answer()
+        return
     platform = callback.data.split(":")[1]
     await state.update_data(platform=platform)
     await state.set_state(AdminAddSubscription.title)
@@ -455,6 +520,9 @@ async def add_sub_platform(callback: CallbackQuery, state: FSMContext):
 
 @router.message(AdminAddSubscription.title)
 async def add_sub_title(message: Message, state: FSMContext):
+    if not message.text:
+        await message.answer("❗️ Iltimos, matn yuboring.")
+        return
     await state.update_data(title=message.text)
     await state.set_state(AdminAddSubscription.url)
     await message.answer("🔗 Havolasini kiriting (https://t.me/... yoki instagram/youtube havolasi):")
@@ -462,6 +530,9 @@ async def add_sub_title(message: Message, state: FSMContext):
 
 @router.message(AdminAddSubscription.url)
 async def add_sub_url(message: Message, state: FSMContext, session: AsyncSession):
+    if not message.text:
+        await message.answer("❗️ Iltimos, havolani matn ko'rinishida yuboring.")
+        return
     data = await state.get_data()
     await state.update_data(url=message.text)
 
@@ -481,9 +552,12 @@ async def add_sub_url(message: Message, state: FSMContext, session: AsyncSession
 
 @router.message(AdminAddSubscription.chat_id)
 async def add_sub_chat_id(message: Message, state: FSMContext, session: AsyncSession):
+    if not message.text:
+        await message.answer("❗️ Iltimos, kanal username yoki chat_id ni matn ko'rinishida yuboring.")
+        return
     data = await state.get_data()
     sub = await crud.add_subscription(
-        session, platform=data["platform"], title=data["title"], url=data["url"], chat_id=message.text.strip()
+        session, platform=data["platform"], title=data["title"], url=data["url"], chat_id=(message.text or "").strip()
     )
     await state.clear()
     await message.answer(f"✅ Obuna qo'shildi: {sub.title}", reply_markup=admin_kb.admin_menu_kb())
@@ -520,7 +594,7 @@ async def referral_settings(message: Message, session: AsyncSession, state: FSMC
 
 @router.message(AdminReferralPercent.percent)
 async def set_referral_percent(message: Message, state: FSMContext, session: AsyncSession):
-    if not message.text.replace(".", "", 1).isdigit():
+    if not (message.text or "").replace(".", "", 1).isdigit():
         await message.answer("❗️ Faqat raqam kiriting.")
         return
     await crud.set_referral_percent(session, float(message.text))
@@ -543,7 +617,7 @@ async def list_topup_requests(message: Message, session: AsyncSession):
         user = await crud.get_user(session, req.user_id)
         caption = (
             f"💳 <b>To'lov so'rovi #{req.id}</b>\n\n"
-            f"👤 {user.full_name if user else '—'} (@{user.username if user else '—'})\n"
+            f"👤 {html.escape(user.full_name or '—') if user else '—'} (@{user.username if user else '—'})\n"
             f"🆔 ID: <code>{req.user_id}</code>\n"
             f"💵 Miqdor: {req.amount:,.0f} so'm"
         )
@@ -559,18 +633,23 @@ async def topup_approve(callback: CallbackQuery, session: AsyncSession, bot: Bot
         await callback.answer()
         return
     request_id = int(callback.data.split(":")[1])
-    req = await crud.process_topup_request(session, request_id, approve=True, admin_id=callback.from_user.id)
+    req, changed = await crud.process_topup_request(session, request_id, approve=True, admin_id=callback.from_user.id)
     if not req:
         await callback.answer("So'rov topilmadi.", show_alert=True)
         return
+    if not changed:
+        # boshqa admin allaqachon ko'rib chiqqan - balans ikki marta to'ldirilmaydi
+        await _append_note(callback.message, f"\n\nℹ️ Bu so'rov allaqachon ko'rib chiqilgan ({req.status}).")
+        await callback.answer("Bu so'rov allaqachon ko'rib chiqilgan.", show_alert=True)
+        return
 
-    await callback.message.edit_caption(caption=(callback.message.caption or "") + "\n\n✅ TASDIQLANDI")
+    await _append_note(callback.message, "\n\n✅ TASDIQLANDI")
     try:
         await bot.send_message(
             req.user_id, f"✅ To'lov so'rovingiz (#{req.id}, {req.amount:,.0f} so'm) tasdiqlandi! Balansingiz yangilandi."
         )
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("To'lov tasdiqlangani haqida mijozga xabar yuborilmadi (user_id=%s): %s", req.user_id, e)
     await callback.answer("Tasdiqlandi, balans yangilandi")
 
 
@@ -580,18 +659,22 @@ async def topup_reject(callback: CallbackQuery, session: AsyncSession, bot: Bot)
         await callback.answer()
         return
     request_id = int(callback.data.split(":")[1])
-    req = await crud.process_topup_request(session, request_id, approve=False, admin_id=callback.from_user.id)
+    req, changed = await crud.process_topup_request(session, request_id, approve=False, admin_id=callback.from_user.id)
     if not req:
         await callback.answer("So'rov topilmadi.", show_alert=True)
         return
+    if not changed:
+        await _append_note(callback.message, f"\n\nℹ️ Bu so'rov allaqachon ko'rib chiqilgan ({req.status}).")
+        await callback.answer("Bu so'rov allaqachon ko'rib chiqilgan.", show_alert=True)
+        return
 
-    await callback.message.edit_caption(caption=(callback.message.caption or "") + "\n\n❌ BEKOR QILINDI")
+    await _append_note(callback.message, "\n\n❌ BEKOR QILINDI")
     try:
         await bot.send_message(
             req.user_id, f"❌ To'lov so'rovingiz (#{req.id}, {req.amount:,.0f} so'm) rad etildi. Admin bilan bog'laning."
         )
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("To'lov rad etilgani haqida mijozga xabar yuborilmadi (user_id=%s): %s", req.user_id, e)
     await callback.answer("Rad etildi")
 
 
@@ -613,7 +696,10 @@ async def show_admins(message: Message, session: AsyncSession):
 
 
 @router.callback_query(F.data == "admin_add")
-async def admin_add_start(callback: CallbackQuery, state: FSMContext):
+async def admin_add_start(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
+    if not await require_admin(callback.from_user.id, session):
+        await callback.answer()
+        return
     await state.set_state(AdminManageAdmins.add_id)
     await callback.message.answer(
         "🆔 Yangi admin qilinadigan foydalanuvchining Telegram ID raqamini kiriting.\n"
@@ -625,7 +711,7 @@ async def admin_add_start(callback: CallbackQuery, state: FSMContext):
 
 @router.message(AdminManageAdmins.add_id)
 async def admin_add_finish(message: Message, state: FSMContext, session: AsyncSession):
-    if not message.text.isdigit():
+    if not (message.text or "").isdigit():
         await message.answer("❗️ Faqat raqam (ID) kiriting.")
         return
     new_admin_id = int(message.text)
@@ -674,6 +760,9 @@ async def text_edit_menu(message: Message, session: AsyncSession):
 
 @router.callback_query(F.data.startswith("tedit:"))
 async def text_edit_start(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
+    if not await require_admin(callback.from_user.id, session):
+        await callback.answer()
+        return
     key = callback.data.split(":")[1]
     current = await crud.get_text(session, key)
     await state.update_data(text_key=key)
@@ -688,9 +777,12 @@ async def text_edit_start(callback: CallbackQuery, state: FSMContext, session: A
 
 @router.message(AdminEditText.waiting_value)
 async def text_edit_finish(message: Message, state: FSMContext, session: AsyncSession):
+    if not message.html_text:
+        await message.answer("❗️ Iltimos, matn yuboring.")
+        return
     data = await state.get_data()
     key = data.get("text_key")
-    await crud.set_text(session, key, message.html_text or message.text)
+    await crud.set_text(session, key, message.html_text)
     await state.clear()
     await message.answer(f"✅ {TEXT_LABELS.get(key, key)} yangilandi.", reply_markup=admin_kb.admin_menu_kb())
 
@@ -714,7 +806,7 @@ async def _show_user_admin_card(message: Message, session: AsyncSession, user_id
     text = (
         f"👤 <b>Foydalanuvchi ma'lumotlari</b>\n\n"
         f"🆔 ID: <code>{user.id}</code>\n"
-        f"👤 Ism: {user.full_name or '—'}\n"
+        f"👤 Ism: {html.escape(user.full_name or '—')}\n"
         f"🔤 Username: @{user.username or '—'}\n"
         f"📱 Telefon: {user.phone or '—'}\n\n"
         f"💰 Balans: {user.balance:,.0f} so'm\n"
@@ -738,7 +830,7 @@ async def _show_user_admin_card(message: Message, session: AsyncSession, user_id
 
 @router.message(AdminManageUsers.search_id)
 async def manage_users_search(message: Message, state: FSMContext, session: AsyncSession):
-    if not message.text.isdigit():
+    if not (message.text or "").isdigit():
         await message.answer("❗️ Faqat raqam (ID) kiriting.")
         return
     await state.clear()
@@ -760,7 +852,7 @@ async def user_money_start(callback: CallbackQuery, state: FSMContext, session: 
 
 @router.message(AdminManageUsers.balance_amount)
 async def user_money_finish(message: Message, state: FSMContext, session: AsyncSession):
-    if not message.text.replace(".", "", 1).isdigit():
+    if not (message.text or "").replace(".", "", 1).isdigit():
         await message.answer("❗️ Faqat raqam kiriting.")
         return
     data = await state.get_data()
@@ -886,23 +978,23 @@ async def user_message_start(callback: CallbackQuery, state: FSMContext, session
 
 @router.message(AdminManageUsers.message_text)
 async def user_message_finish(message: Message, state: FSMContext, session: AsyncSession, bot: Bot):
+    text = message.html_text
+    if not text:
+        await message.answer("❗️ Iltimos, xabarni matn ko'rinishida yozing.")
+        return
+
     data = await state.get_data()
     user_id = data.get("target_user_id")
     await state.clear()
 
     try:
-        await bot.send_message(user_id, message.html_text or message.text)
+        await bot.send_message(user_id, text)
         await message.answer("✅ Xabar yuborildi.", reply_markup=admin_kb.admin_menu_kb())
     except Exception:
         await message.answer(
             "❗️ Xabar yuborilmadi (foydalanuvchi botni bloklagan bo'lishi mumkin).",
             reply_markup=admin_kb.admin_menu_kb(),
         )
-    lines = [f"🧾 <b>{user_id} foydalanuvchining buyurtmalari:</b>\n"]
-    for o in orders:
-        lines.append(f"#{o.id} — {o.product_name} — {o.price:,.0f} so'm — {o.status}")
-    await callback.message.answer("\n".join(lines))
-    await callback.answer()
 
 
 # ---------- XABAR YUBORISH (BROADCAST) ----------
@@ -920,6 +1012,11 @@ async def broadcast_send(message: Message, state: FSMContext, session: AsyncSess
     from sqlalchemy import select
     from bot.database.models import User
 
+    text = message.html_text
+    if not text:
+        await message.answer("❗️ Hozircha faqat matnli xabar yuborish mumkin. Matn yozing:")
+        return
+
     await state.clear()
     result = await session.execute(select(User.id).where(User.is_blocked == False))  # noqa: E712
     user_ids = result.scalars().all()
@@ -929,7 +1026,7 @@ async def broadcast_send(message: Message, state: FSMContext, session: AsyncSess
 
     for i, uid in enumerate(user_ids, start=1):
         try:
-            await bot.send_message(uid, message.html_text or message.text)
+            await bot.send_message(uid, text)
             sent += 1
         except Exception:
             failed += 1
