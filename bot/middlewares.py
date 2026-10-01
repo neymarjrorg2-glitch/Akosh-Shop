@@ -1,44 +1,23 @@
-import logging
-from typing import Any, Awaitable, Callable, Dict
-
+"""aiogram middleware'lari."""
 from aiogram import BaseMiddleware
-from aiogram.types import TelegramObject, Update
+from aiogram.types import CallbackQuery, Message
 
-from bot.config import ADMIN_IDS
-from bot.database.engine import async_session
-from bot.database.models import User
-
-logger = logging.getLogger(__name__)
+import config
+import database as db
 
 
-class DatabaseMiddleware(BaseMiddleware):
-    """Har bir so'rovga DB session ulaydi va bloklangan foydalanuvchilarni to'xtatadi."""
+class BlockedUserMiddleware(BaseMiddleware):
+    """Admin tomonidan bloklangan foydalanuvchining barcha xabar va tugmalarini to'xtatadi
+    (oldin bloklash faqat Web App API'da ishlardi, botning o'zida emas)."""
 
-    async def __call__(
-        self,
-        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
-        event: TelegramObject,
-        data: Dict[str, Any],
-    ) -> Any:
-        async with async_session() as session:
-            data["session"] = session
-
-            tg_user = data.get("event_from_user")
-            if tg_user and isinstance(event, Update):
-                user = await session.get(User, tg_user.id)
-                if user and user.is_blocked and not user.is_admin and tg_user.id not in ADMIN_IDS:
-                    await self._notify_blocked(event)
-                    return None
-
-            return await handler(event, data)
-
-    @staticmethod
-    async def _notify_blocked(event: Update) -> None:
-        text = "⛔️ Siz botdan foydalanish huquqidan mahrum qilingansiz."
-        try:
-            if event.message:
-                await event.message.answer(text)
-            elif event.callback_query:
-                await event.callback_query.answer(text, show_alert=True)
-        except Exception as e:
-            logger.debug("Bloklangan foydalanuvchiga xabar yuborilmadi: %s", e)
+    async def __call__(self, handler, event, data):
+        user = data.get("event_from_user")
+        if user and user.id not in config.ADMIN_IDS:
+            row = await db.get_user(user.id)
+            if row and row["blocked"]:
+                if isinstance(event, CallbackQuery):
+                    await event.answer("🚫 Siz bloklangansiz.", show_alert=True)
+                elif isinstance(event, Message):
+                    await event.answer("🚫 Siz bloklangansiz.")
+                return None
+        return await handler(event, data)
