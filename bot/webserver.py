@@ -27,8 +27,8 @@ import database as db
 import force_sub
 import keyboards as kb
 import services
-import utils
-from utils import esc, safe_send
+import botutils
+from botutils import esc, safe_send
 
 logger = logging.getLogger("starnest.web")
 
@@ -442,7 +442,7 @@ async def api_create_order(request: web.Request):
     bot = request.app["bot"]
     markup = kb.order_decision_keyboard(order["id"])
     for admin_id in config.ADMIN_IDS:
-        utils.spawn(safe_send(bot, admin_id, text, reply_markup=markup))
+        botutils.spawn(safe_send(bot, admin_id, text, reply_markup=markup))
 
     return json_response({"order": dict(order)})
 
@@ -961,7 +961,7 @@ async def api_admin_broadcast(request: web.Request):
     text = str(body.get("text", "")).strip()
     if not text or len(text) > 4000:
         return json_response({"error": "invalid_text"}, 400)
-    if utils.start_broadcast(request.app["bot"], text) is None:
+    if botutils.start_broadcast(request.app["bot"], text) is None:
         return json_response({"error": "already_running"}, 409)
     return json_response({"ok": True, "started": True})
 
@@ -969,7 +969,7 @@ async def api_admin_broadcast(request: web.Request):
 @routes.get("/api/admin/broadcast/status")
 async def api_admin_broadcast_status(request: web.Request):
     await _require_admin(request)
-    return json_response(dict(utils.BROADCAST))
+    return json_response(dict(botutils.BROADCAST))
 
 
 # ---------- Adminlar ----------

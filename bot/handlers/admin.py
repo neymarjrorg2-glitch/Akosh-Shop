@@ -20,7 +20,7 @@ import database as db
 import keyboards as kb
 import services
 from states import AdminEdit
-from utils import esc, start_broadcast, BROADCAST
+from botutils import esc, start_broadcast, BROADCAST
 
 router = Router(name="admin")
 

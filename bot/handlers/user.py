@@ -11,7 +11,7 @@ import database as db
 import keyboards as kb
 import force_sub
 from states import UserFlow
-from utils import safe_send
+from botutils import safe_send
 
 router = Router(name="user")
 
